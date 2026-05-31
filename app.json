@@ -46,12 +46,10 @@
         "expo-notifications",
         {
           "icon": "./assets/notification-icon.png",
-          "color": "#1e40af",
-          "sounds": [
-            "./assets/notification.wav"
-          ]
+          "color": "#1e40af"
         }
-      ]
+      ],
+      "expo-font"
     ],
     "experiments": {
       "typedRoutes": true
