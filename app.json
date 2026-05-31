@@ -51,6 +51,12 @@
             "./assets/notification.wav"
           ]
         }
+      ],
+      [
+        "expo-sqlite",
+        {
+          "enableBridgeless": false
+        }
       ]
     ],
     "experiments": {
