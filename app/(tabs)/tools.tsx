@@ -1,4 +1,4 @@
-import { useState, useMemo, Component, type ReactNode } from "react";
+import { useState, useMemo, useCallback, Component, type ReactNode } from "react";
 import {
   View,
   Text,
