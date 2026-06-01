@@ -1,4 +1,4 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, Component, type ReactNode } from "react";
 import {
   View,
   Text,
@@ -30,6 +30,62 @@ if (
   UIManager.setLayoutAnimationEnabledExperimental
 ) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
+}
+
+// ─── 安全数字格式化 ────────────────────────────────────────
+
+/** 将任意值安全转为保留 fixed 位的字符串，NaN/Infinity 返回 '--' */
+function safeNum(v: unknown, digits = 2): string {
+  const n = typeof v === "number" ? v : parseFloat(v as string);
+  if (!isFinite(n)) return "--";
+  return n.toFixed(digits);
+}
+
+function safeInt(v: unknown): number {
+  const n = parseInt(v as string, 10);
+  return isNaN(n) ? 0 : n;
+}
+
+// ─── ErrorBoundary ─────────────────────────────────────────
+
+interface EBState { hasError: boolean; errorMsg: string }
+
+class ErrorBoundary extends Component<{ children: ReactNode }, EBState> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, errorMsg: "" };
+  }
+
+  static getDerivedStateFromError(err: Error): EBState {
+    return { hasError: true, errorMsg: err.message ?? String(err) };
+  }
+
+  componentDidCatch(err: Error) {
+    console.error("[ToolsScreen] 崩溃:", err);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <SafeAreaView className="flex-1 bg-gray-50" edges={["top"]}>
+          <View className="flex-1 items-center justify-center px-8">
+            <View className="w-16 h-16 rounded-full bg-red-100 items-center justify-center mb-4">
+              <Ionicons name="warning-outline" size={32} color="#ef4444" />
+            </View>
+            <Text className="text-lg font-bold text-gray-800 mb-2">计算工具出错</Text>
+            <Text className="text-gray-500 text-sm text-center mb-4">{this.state.errorMsg}</Text>
+            <TouchableOpacity
+              className="bg-primary-600 px-6 py-2.5 rounded-xl"
+              onPress={() => this.setState({ hasError: false, errorMsg: "" })}
+            >
+              <Text className="text-white font-semibold">重试</Text>
+            </TouchableOpacity>
+          </View>
+        </SafeAreaView>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 // ─── 工具卡片配置 ────────────────────────────────────────────
@@ -205,10 +261,10 @@ function PCRResultTable({ result }: { result: PCRMixResult }) {
 }
 
 // ════════════════════════════════════════════════════════════
-// 主屏幕
+// 主屏幕（内部实现）
 // ════════════════════════════════════════════════════════════
 
-export default function ToolsScreen() {
+function ToolsScreenInner() {
   const [expandedId, setExpandedId] = useState<ToolId | null>(null);
 
   // ── ① 摩尔浓度换算 ──
@@ -224,6 +280,14 @@ export default function ToolsScreen() {
     return calcMolarity(m, mm, v);
   }, [massGram, molarMass, volumeML]);
 
+  // 质量浓度（仅当输入有效时）
+  const massConcText = useMemo(() => {
+    const m = parseFloat(massGram);
+    const v = parseFloat(volumeML);
+    if (isNaN(m) || isNaN(v) || v <= 0 || m <= 0) return "";
+    return `质量浓度: ${safeNum((m / v) * 1000, 2)} mg/mL`;
+  }, [massGram, volumeML]);
+
   // ── ② 稀释计算 ──
   const [stockConc, setStockConc] = useState("");
   const [targetConc, setTargetConc] = useState("");
@@ -233,7 +297,7 @@ export default function ToolsScreen() {
     const s = parseFloat(stockConc);
     const t = parseFloat(targetConc);
     const v = parseFloat(targetVol);
-    if (isNaN(s) || isNaN(t) || isNaN(v) || s <= 0) return null;
+    if (isNaN(s) || isNaN(t) || isNaN(v) || s <= 0 || t <= 0 || v <= 0) return null;
     return calcDilution(s, t, v);
   }, [stockConc, targetConc, targetVol]);
 
@@ -251,13 +315,14 @@ export default function ToolsScreen() {
   );
 
   const pcrResult = useMemo(() => {
-    const vol = parseInt(pcrVol) || 50;
-    const samples = parseInt(pcrSamples) || 1;
+    const vol = safeInt(pcrVol) || 50;
+    const samples = safeInt(pcrSamples) || 1;
     if (vol <= 0 || samples <= 0) return null;
 
     const customComponents = DEFAULT_PCR_COMPONENTS.map((c) => {
       if (c.name === "ddH₂O") return c;
-      return { ...c, ratio: parseFloat(pcrRatios[c.name] ?? String(c.ratio)) || c.ratio };
+      const ratio = parseFloat(pcrRatios[c.name] ?? "");
+      return { ...c, ratio: isNaN(ratio) || ratio < 0 ? c.ratio : ratio };
     });
 
     return calcPCRMix(vol, samples, customComponents);
@@ -271,9 +336,9 @@ export default function ToolsScreen() {
 
   const nanodropResult = useMemo(() => {
     const a = parseFloat(a260);
-    const d = parseFloat(dilFactor) || 1;
-    if (isNaN(a) || a < 0 || d <= 0) return null;
-    return calcNucleicAcidConc(a, d, naType);
+    const d = parseFloat(dilFactor);
+    if (isNaN(a) || a < 0 || isNaN(d) || d <= 0) return null;
+    return calcNucleicAcidConc(a, isNaN(d) ? 1 : d, naType);
   }, [a260, dilFactor, naType]);
 
   const purity = useMemo(() => {
@@ -305,17 +370,19 @@ export default function ToolsScreen() {
   };
 
   const templateResult = useMemo(() => {
+    if (!selectedTemplateId) return null;
     const tmpl = templates.find((t) => t.id === selectedTemplateId);
     if (!tmpl) return null;
     try {
       const comps = JSON.parse(tmpl.components_json) as { name: string; vol_ul: number; ratio: string }[];
-      const n = parseInt(templateReactionCount) || 1;
-      const scale = 1.1; // 10% 余量
-      const totalTubes = Math.ceil(n * scale);
-      const perTube = comps.map((c) => ({ ...c, perTube: c.vol_ul }));
-      const masterMix = comps.map((c) => ({ name: c.name, total: Number((c.vol_ul * totalTubes).toFixed(1)) }));
-      const totalVol = comps.reduce((s, c) => s + c.vol_ul, 0);
-      const mmTotal = totalVol * totalTubes;
+      if (!Array.isArray(comps) || comps.length === 0) return null;
+      const n = safeInt(templateReactionCount) || 1;
+      const scale = 1.1;
+      const totalTubes = Math.max(1, Math.ceil(n * scale));
+      const perTube = comps.map((c) => ({ ...c, perTube: Math.max(0, c.vol_ul ?? 0) }));
+      const masterMix = comps.map((c) => ({ name: c.name, total: Number(((c.vol_ul ?? 0) * totalTubes).toFixed(1)) }));
+      const totalVol = comps.reduce((s, c) => s + Math.max(0, c.vol_ul ?? 0), 0);
+      const mmTotal = Number((totalVol * totalTubes).toFixed(1));
       return { perTube, masterMix, totalVol, mmTotal, n, totalTubes, templateName: tmpl.template_name };
     } catch { return null; }
   }, [selectedTemplateId, templateReactionCount, templates]);
@@ -419,16 +486,13 @@ export default function ToolsScreen() {
                       {molarityResult !== null && (
                         <ResultBox
                           label="摩尔浓度"
-                          value={molarityResult.toFixed(4)}
+                          value={safeNum(molarityResult, 4)}
                           unit="mol/L"
                         />
                       )}
                       {molarityResult !== null && (
                         <Text className="text-gray-400 text-xs mt-2 text-center">
-                          = {(molarityResult * 1000).toFixed(2)} mM ·{" "}
-                          {parseFloat(massGram) > 0
-                            ? `质量浓度: ${((parseFloat(massGram) / parseFloat(volumeML)) * 1000).toFixed(2)} mg/mL`
-                            : ""}
+                          = {safeNum(molarityResult * 1000, 2)} mM{ massConcText ? ` · ${massConcText}` : "" }
                         </Text>
                       )}
                     </View>
@@ -769,5 +833,14 @@ export default function ToolsScreen() {
         <View className="h-6" />
       </ScrollView>
     </SafeAreaView>
+  );
+}
+
+/** 使用 ErrorBoundary 包裹的默认导出 */
+export default function ToolsScreen() {
+  return (
+    <ErrorBoundary>
+      <ToolsScreenInner />
+    </ErrorBoundary>
   );
 }
