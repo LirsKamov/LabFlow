@@ -205,6 +205,21 @@ export default function KitParserScreen() {
         );
       }
 
+      // Save SOP steps as an experiment_template for later import
+      if (kit.sopSteps.length > 0) {
+        const sopJson = JSON.stringify(kit.sopSteps.map((s) => ({
+          step_num: s.step_num,
+          title: s.title,
+          description: s.description,
+          duration_min: s.duration_min,
+          timer_required: s.timer_required,
+        })));
+        await db.runAsync(
+          "INSERT INTO experiment_templates (name, description, kit_id, sop_steps_json, tags, source_experiment_id) VALUES (?, ?, ?, ?, ?, ?)",
+          [`${kit.kitName} SOP`, `从 ${kit.brand || '试剂盒'} 说明书解析`, kitId, sopJson, 'kit-sop', null]
+        );
+      }
+
       Alert.alert("保存成功", `试剂盒「${kit.kitName}」已保存`, [
         { text: "确定", onPress: () => router.back() },
       ]);

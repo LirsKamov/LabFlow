@@ -462,20 +462,26 @@ export default function ExperimentScreen() {
   const loadKitSOPsForImport = async () => {
     try {
       const db = await SQLite.openDatabaseAsync("labflow.db");
-      const allKits = await db.getAllAsync<{ id: number; name: string }>("SELECT id, name FROM kits ORDER BY name");
+      const rows = await db.getAllAsync<{ id: number; kit_id: number; name: string; sop_steps_json: string }>(
+        "SELECT et.id, et.kit_id, k.name AS kitName, et.sop_steps_json FROM experiment_templates et JOIN kits k ON et.kit_id = k.id WHERE et.sop_steps_json IS NOT NULL AND et.sop_steps_json != '[]' AND et.tags = 'kit-sop'"
+      );
       const result: typeof kitImportData = [];
-      for (const kit of allKits) {
-        const tmpls = await db.getAllAsync<{ sop_steps_json: string }>(
-          "SELECT sop_steps_json FROM reaction_templates WHERE kit_id = ? LIMIT 1", [kit.id]
-        );
-        if (tmpls.length > 0) {
-          try {
-            const steps = JSON.parse(tmpls[0].sop_steps_json || "[]");
-            if (Array.isArray(steps) && steps.length > 0) {
-              result.push({ kitId: kit.id, kitName: kit.name, steps });
+      // Group by kit (one template per kit)
+      const seenKits = new Set<number>();
+      for (const row of rows) {
+        try {
+          const steps = JSON.parse(row.sop_steps_json);
+          if (Array.isArray(steps) && steps.length > 0) {
+            const kitName = await (async () => {
+              const kit = await db.getFirstAsync<{ name: string }>("SELECT name FROM kits WHERE id = ?", [row.kit_id]);
+              return kit?.name ?? "未知试剂盒";
+            })();
+            if (!seenKits.has(row.kit_id)) {
+              seenKits.add(row.kit_id);
+              result.push({ kitId: row.kit_id, kitName, steps });
             }
-          } catch { /* parse error */ }
-        }
+          }
+        } catch { /* parse error */ }
       }
       setKitImportData(result);
       setKitImportVisible(true);
