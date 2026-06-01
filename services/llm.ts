@@ -11,6 +11,13 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import type { Experiment, Todo } from "../db/schema";
 
+// ─── API 端点 ────────────────────────────────────────────────
+
+const API_ENDPOINTS = {
+  anthropic: "https://api.anthropic.com/v1/messages",
+  deepseek: "https://api.deepseek.com/v1/chat/completions",
+};
+
 // ─── 类型定义 ────────────────────────────────────────────────
 
 export type LLMProvider = "anthropic" | "deepseek";
@@ -45,14 +52,21 @@ export interface DailyPlan {
 
 /** 保存 LLM 设置（供 useLLMSettings Hook 使用） */
 export async function saveLLMSettings(settings: LLMSettings): Promise<void> {
-  await AsyncStorage.setItem("api_key_deepseek", settings.apiKey);
+  await AsyncStorage.multiSet([
+    ["api_key_deepseek", settings.apiKey],
+    ["llm_provider", settings.provider],
+    ["llm_model", settings.model],
+  ]);
 }
 
 /** 读取 LLM 设置 */
 export async function getLLMSettings(): Promise<LLMSettings | null> {
-  const apiKey = await AsyncStorage.getItem("api_key_deepseek");
+  const pairs = await AsyncStorage.multiGet(["api_key_deepseek", "llm_provider", "llm_model"]);
+  const apiKey = pairs[0][1];
+  const provider = (pairs[1][1] as LLMProvider) || "deepseek";
+  const model = pairs[2][1];
   if (!apiKey) return null;
-  return { provider: "deepseek", apiKey, model: "deepseek-chat" };
+  return { provider, apiKey, model: model || (provider === "anthropic" ? "claude-sonnet-4-20250514" : "deepseek-chat") };
 }
 
 /** 仅获取 API Key */

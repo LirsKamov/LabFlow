@@ -42,7 +42,7 @@ export default function SettingsScreen() {
     Alert.alert("清除设置", "确定清除所有 API Key？", [
       { text: "取消", style: "cancel" },
       { text: "清除", style: "destructive", onPress: async () => {
-        await AsyncStorage.multiRemove(["api_key_glm", "api_key_deepseek"]);
+        await AsyncStorage.multiRemove(["api_key_glm", "api_key_deepseek", "llm_provider", "llm_model"]);
         setGlmKey(""); setDeepseekKey("");
       }},
     ]);
@@ -61,7 +61,7 @@ export default function SettingsScreen() {
               for (const t of tables) {
                 try { await db.execAsync(`DELETE FROM ${t}`); } catch {}
               }
-              await AsyncStorage.multiRemove(["api_key_glm", "api_key_deepseek"]);
+              await AsyncStorage.multiRemove(["api_key_glm", "api_key_deepseek", "llm_provider", "llm_model"]);
               setGlmKey(""); setDeepseekKey("");
               Alert.alert("已清除", "所有数据已被删除");
             } catch (err: any) { Alert.alert("操作失败", err?.message ?? "请重试"); }
