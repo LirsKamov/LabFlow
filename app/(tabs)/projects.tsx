@@ -17,6 +17,7 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "expo-router";
+import * as SQLite from "expo-sqlite";
 import { useProjects, type ProjectWithStats } from "../../hooks/useProjects";
 import { useTodos } from "../../hooks/useTodos";
 import type { Todo } from "../../db/schema";
@@ -148,6 +149,15 @@ export default function ProjectsScreen() {
   const [todoPriority, setTodoPriority] = useState<Todo["priority"]>("medium");
   const [todoDueDate, setTodoDueDate] = useState("");
 
+  // ── 新建实验 Modal ──
+  const [expModalVisible, setExpModalVisible] = useState(false);
+  const [expTargetProjId, setExpTargetProjId] = useState<number | null>(null);
+  const [expName, setExpName] = useState("");
+  const [expDesc, setExpDesc] = useState("");
+  const [expDate, setExpDate] = useState(new Date().toISOString().split("T")[0]);
+  const [expKitId, setExpKitId] = useState<number | null>(null);
+  const [kits, setKits] = useState<{ id: number; name: string }[]>([]);
+
   // ── 下拉刷新 ──
   const [refreshing, setRefreshing] = useState(false);
 
@@ -202,7 +212,7 @@ export default function ProjectsScreen() {
     setModalVisible(true);
   };
 
-  // ── 提交表单 ──
+  // ── 提交项目表单 ──
   const submitForm = async () => {
     const name = formName.trim();
     if (!name) { Alert.alert("提示", "请输入项目名称"); return; }
@@ -215,6 +225,46 @@ export default function ProjectsScreen() {
       setModalVisible(false);
     } catch (err: any) {
       Alert.alert("错误", err.message ?? "操作失败");
+    }
+  };
+
+  // ── 加载试剂盒列表 ──
+  const loadKits = async () => {
+    try {
+      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const rows = await db.getAllAsync<{ id: number; name: string }>(
+        "SELECT id, name FROM kits ORDER BY name"
+      );
+      setKits(rows);
+    } catch { /* 表可能尚不存在 */ }
+  };
+
+  // ── 打开新建实验 Modal ──
+  const openExpModal = (projId: number) => {
+    setExpTargetProjId(projId);
+    setExpName("");
+    setExpDesc("");
+    setExpDate(new Date().toISOString().split("T")[0]);
+    setExpKitId(null);
+    loadKits();
+    setExpModalVisible(true);
+  };
+
+  // ── 提交新建实验 ──
+  const submitExperiment = async () => {
+    const name = expName.trim();
+    if (!name) { Alert.alert("提示", "请输入实验名称"); return; }
+    try {
+      const db = await SQLite.openDatabaseAsync("labflow.db");
+      await db.runAsync(
+        `INSERT INTO experiments (project_id, kit_id, name, description, scheduled_date, status)
+         VALUES (?, ?, ?, ?, ?, 'planned')`,
+        [expTargetProjId, expKitId, name, expDesc.trim(), expDate]
+      );
+      setExpModalVisible(false);
+      await loadProjects();
+    } catch (err: any) {
+      Alert.alert("错误", err.message ?? "创建失败");
     }
   };
 
@@ -398,6 +448,13 @@ export default function ProjectsScreen() {
                 <View className="bg-white mx-1 rounded-b-2xl px-5 pb-5 border border-t-0 border-gray-100 -mt-1">
                   {/* 操作按钮 */}
                   <View className="flex-row justify-end space-x-2 mt-2 mb-3">
+                    <TouchableOpacity
+                      className="flex-row items-center bg-primary-50 px-3 py-1.5 rounded-lg border border-primary-200"
+                      onPress={() => openExpModal(proj.id)}
+                    >
+                      <Ionicons name="add-circle-outline" size={16} color="#2563eb" />
+                      <Text className="text-primary-600 text-xs font-semibold ml-1">新建实验</Text>
+                    </TouchableOpacity>
                     <TouchableOpacity
                       className="flex-row items-center bg-gray-50 px-3 py-1.5 rounded-lg"
                       onPress={() => {
@@ -608,6 +665,99 @@ export default function ProjectsScreen() {
                 <Text className="text-white font-semibold">
                   {editingProject ? "保存修改" : "创建项目"}
                 </Text>
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── 新建实验 Modal ── */}
+      <Modal
+        visible={expModalVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setExpModalVisible(false)}
+      >
+        <Pressable
+          className="flex-1 bg-black/40 justify-end"
+          onPress={() => setExpModalVisible(false)}
+        >
+          <Pressable
+            className="bg-white rounded-t-3xl px-5 pt-6 pb-10"
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View className="w-10 h-1 bg-gray-200 rounded-full self-center mb-5" />
+            <Text className="text-xl font-bold text-gray-900 mb-5">新建实验</Text>
+
+            <Text className="text-sm font-semibold text-gray-600 mb-1.5">实验名称 *</Text>
+            <TextInput
+              className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
+              placeholder="输入实验名称"
+              placeholderTextColor="#d1d5db"
+              value={expName}
+              onChangeText={setExpName}
+              autoFocus
+              maxLength={100}
+            />
+
+            <Text className="text-sm font-semibold text-gray-600 mb-1.5">描述</Text>
+            <TextInput
+              className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
+              placeholder="简要描述实验目的..."
+              placeholderTextColor="#d1d5db"
+              value={expDesc}
+              onChangeText={setExpDesc}
+              multiline
+              numberOfLines={2}
+              textAlignVertical="top"
+              maxLength={300}
+            />
+
+            <Text className="text-sm font-semibold text-gray-600 mb-1.5">计划日期</Text>
+            <TextInput
+              className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
+              placeholder="YYYY-MM-DD"
+              placeholderTextColor="#d1d5db"
+              value={expDate}
+              onChangeText={setExpDate}
+              maxLength={10}
+            />
+
+            <Text className="text-sm font-semibold text-gray-600 mb-1.5">关联试剂盒（可选）</Text>
+            {kits.length === 0 ? (
+              <Text className="text-gray-400 text-xs mb-4">暂无试剂盒</Text>
+            ) : (
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-4" style={{ maxHeight: 48 }}>
+                <TouchableOpacity
+                  className={`px-3 py-2 rounded-lg mr-2 ${expKitId === null ? "bg-primary-100 border border-primary-300" : "bg-gray-100"}`}
+                  onPress={() => setExpKitId(null)}
+                >
+                  <Text className={`text-xs font-medium ${expKitId === null ? "text-primary-700" : "text-gray-500"}`}>不关联</Text>
+                </TouchableOpacity>
+                {kits.map((k) => (
+                  <TouchableOpacity
+                    key={k.id}
+                    className={`px-3 py-2 rounded-lg mr-2 ${expKitId === k.id ? "bg-primary-100 border border-primary-300" : "bg-gray-100"}`}
+                    onPress={() => setExpKitId(k.id)}
+                  >
+                    <Text className={`text-xs font-medium ${expKitId === k.id ? "text-primary-700" : "text-gray-500"}`} numberOfLines={1}>{k.name}</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            )}
+
+            <View className="flex-row space-x-3 mt-2">
+              <TouchableOpacity
+                className="flex-1 bg-gray-100 py-3.5 rounded-xl items-center"
+                onPress={() => setExpModalVisible(false)}
+              >
+                <Text className="text-gray-600 font-semibold">取消</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                className="flex-1 bg-primary-600 py-3.5 rounded-xl items-center shadow-sm shadow-primary-300"
+                onPress={submitExperiment}
+              >
+                <Text className="text-white font-semibold">创建实验</Text>
               </TouchableOpacity>
             </View>
           </Pressable>
