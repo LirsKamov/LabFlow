@@ -8,6 +8,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import * as SQLite from "expo-sqlite";
+import DatePickerField from "../components/DatePickerField";
 import {
   getTemplates, getAllTags, instantiateTemplate,
   saveAsTemplate, detectVariableFields,
@@ -48,7 +49,7 @@ export default function TemplatesScreen() {
   // Instantiate bottom sheet
   const [instantiating, setInstantiating] = useState<TemplateSummary | null>(null);
   const [instProjectId, setInstProjectId] = useState<number | null>(null);
-  const [instDate, setInstDate] = useState(new Date().toISOString().split("T")[0]);
+  const [instDate, setInstDate] = useState(new Date());
   const [instVars, setInstVars] = useState<Record<string, string>>({});
   const [instProjects, setInstProjects] = useState<{ id: number; name: string }[]>([]);
   const [instStepExpanded, setInstStepExpanded] = useState(false);
@@ -112,7 +113,7 @@ export default function TemplatesScreen() {
     if (!instantiating) return;
     try {
       const { experimentId } = await instantiateTemplate(
-        instantiating.id, instProjectId, instDate, instVars
+        instantiating.id, instProjectId, instDate.toISOString().split("T")[0], instVars
       );
       Alert.alert("创建成功", `实验已创建`, [
         { text: "查看", onPress: () => { setInstantiating(null); router.back(); } },
@@ -277,8 +278,7 @@ export default function TemplatesScreen() {
                   ))}
                 </ScrollView>
                 {/* 日期 */}
-                <Text className="text-sm font-semibold text-gray-600 mb-1.5">实验日期</Text>
-                <TextInput className="input-field mb-4" value={instDate} onChangeText={setInstDate} placeholder="YYYY-MM-DD" />
+                <DatePickerField date={instDate} onDateChange={(s) => setInstDate(new Date(s))} label="实验日期" />
                 {/* 变量表单 */}
                 {(() => {
                   try {

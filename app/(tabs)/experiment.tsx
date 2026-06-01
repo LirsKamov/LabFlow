@@ -21,6 +21,7 @@ import { useFocusEffect, router } from "expo-router";
 import * as SQLite from "expo-sqlite";
 import { useExperiment } from "../../hooks/useExperiment";
 import { useTimer } from "../../hooks/useTimer";
+import DatePickerField from "../../components/DatePickerField";
 import { deductKitUsage, getDeductionPreview, type DeductionPreview } from "../../services/inventoryService";
 import type { Experiment, SopStep } from "../../db/schema";
 
@@ -256,7 +257,7 @@ export default function ExperimentScreen() {
   const [expModalVisible, setExpModalVisible] = useState(false);
   const [expName, setExpName] = useState("");
   const [expDesc, setExpDesc] = useState("");
-  const [expDate, setExpDate] = useState(new Date().toISOString().split("T")[0]);
+  const [expDate, setExpDate] = useState(new Date());
   const [expKitId, setExpKitId] = useState<number | null>(null);
   const [kits, setKits] = useState<{ id: number; name: string }[]>([]);
 
@@ -406,7 +407,7 @@ export default function ExperimentScreen() {
   const openExpModal = () => {
     setExpName("");
     setExpDesc("");
-    setExpDate(new Date().toISOString().split("T")[0]);
+    setExpDate(new Date());
     setExpKitId(null);
     loadKits();
     setExpModalVisible(true);
@@ -421,7 +422,7 @@ export default function ExperimentScreen() {
       await db.runAsync(
         `INSERT INTO experiments (kit_id, name, description, scheduled_date, status)
          VALUES (?, ?, ?, ?, 'planned')`,
-        [expKitId, name, expDesc.trim(), expDate]
+        [expKitId, name, expDesc.trim(), expDate.toISOString().split("T")[0]]
       );
       setExpModalVisible(false);
       if (viewMode === "today") await loadTodayExperiments();
@@ -1278,15 +1279,7 @@ export default function ExperimentScreen() {
               maxLength={300}
             />
 
-            <Text className="text-sm font-semibold text-gray-600 mb-1.5">计划日期</Text>
-            <TextInput
-              className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
-              placeholder="YYYY-MM-DD"
-              placeholderTextColor="#d1d5db"
-              value={expDate}
-              onChangeText={setExpDate}
-              maxLength={10}
-            />
+            <DatePickerField date={expDate} onDateChange={(s) => setExpDate(new Date(s))} label="计划日期" />
 
             <Text className="text-sm font-semibold text-gray-600 mb-1.5">关联试剂盒（可选）</Text>
             {kits.length === 0 ? (

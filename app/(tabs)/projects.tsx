@@ -21,6 +21,7 @@ import * as SQLite from "expo-sqlite";
 import { useProjects, type ProjectWithStats } from "../../hooks/useProjects";
 import { useTodos } from "../../hooks/useTodos";
 import { getKitSummaries } from "../../services/inventoryService";
+import DatePickerField from "../../components/DatePickerField";
 import type { Todo } from "../../db/schema";
 
 // Android 需要显式启用 LayoutAnimation
@@ -148,14 +149,14 @@ export default function ProjectsScreen() {
   // ── 待办输入 ──
   const [todoTitle, setTodoTitle] = useState("");
   const [todoPriority, setTodoPriority] = useState<Todo["priority"]>("medium");
-  const [todoDueDate, setTodoDueDate] = useState("");
+  const [todoDueDate, setTodoDueDate] = useState<Date | null>(null);
 
   // ── 新建实验 Modal ──
   const [expModalVisible, setExpModalVisible] = useState(false);
   const [expTargetProjId, setExpTargetProjId] = useState<number | null>(null);
   const [expName, setExpName] = useState("");
   const [expDesc, setExpDesc] = useState("");
-  const [expDate, setExpDate] = useState(new Date().toISOString().split("T")[0]);
+  const [expDate, setExpDate] = useState(new Date());
   const [expKitId, setExpKitId] = useState<number | null>(null);
   const [kits, setKits] = useState<{ id: number; name: string }[]>([]);
 
@@ -196,7 +197,7 @@ export default function ProjectsScreen() {
       setExpandedId(null);
       setTodoTitle("");
       setTodoPriority("medium");
-      setTodoDueDate("");
+      setTodoDueDate(null);
     } else {
       setExpandedId(id);
     }
@@ -264,7 +265,7 @@ export default function ProjectsScreen() {
     setExpTargetProjId(projId);
     setExpName("");
     setExpDesc("");
-    setExpDate(new Date().toISOString().split("T")[0]);
+    setExpDate(new Date());
     setExpKitId(null);
     loadKits();
     setExpModalVisible(true);
@@ -279,7 +280,7 @@ export default function ProjectsScreen() {
       await db.runAsync(
         `INSERT INTO experiments (project_id, kit_id, name, description, scheduled_date, status)
          VALUES (?, ?, ?, ?, ?, 'planned')`,
-        [expTargetProjId, expKitId, name, expDesc.trim(), expDate]
+        [expTargetProjId, expKitId, name, expDesc.trim(), expDate.toISOString().split("T")[0]]
       );
       setExpModalVisible(false);
       await loadProjects();
@@ -312,10 +313,10 @@ export default function ProjectsScreen() {
   const handleAddTodo = async () => {
     if (!todoTitle.trim()) { Alert.alert("提示", "请输入待办内容"); return; }
     try {
-      await addTodo(todoTitle.trim(), todoPriority, todoDueDate || null);
+      await addTodo(todoTitle.trim(), todoPriority, todoDueDate?.toISOString().split("T")[0] ?? null);
       setTodoTitle("");
       setTodoPriority("medium");
-      setTodoDueDate("");
+      setTodoDueDate(null);
       await loadProjects(); // 刷新进度条
     } catch (err: any) { Alert.alert("错误", err.message ?? "添加失败"); }
   };
@@ -639,14 +640,12 @@ export default function ProjectsScreen() {
                           </TouchableOpacity>
                         ))}
                       </View>
-                      <TextInput
-                        className="flex-1 bg-gray-50 border border-gray-200 rounded-lg px-2.5 py-1.5 text-xs text-gray-600"
-                        placeholder="截止日期 (YYYY-MM-DD)"
-                        placeholderTextColor="#d1d5db"
-                        value={todoDueDate}
-                        onChangeText={setTodoDueDate}
-                        keyboardType="numbers-and-punctuation"
-                      />
+                      <View className="flex-1 mr-2">
+                        <DatePickerField
+                          date={todoDueDate ?? new Date()}
+                          onDateChange={(s) => setTodoDueDate(new Date(s))}
+                        />
+                      </View>
                     </View>
                   </View>
                 </View>
@@ -765,15 +764,7 @@ export default function ProjectsScreen() {
               maxLength={300}
             />
 
-            <Text className="text-sm font-semibold text-gray-600 mb-1.5">计划日期</Text>
-            <TextInput
-              className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
-              placeholder="YYYY-MM-DD"
-              placeholderTextColor="#d1d5db"
-              value={expDate}
-              onChangeText={setExpDate}
-              maxLength={10}
-            />
+            <DatePickerField date={expDate} onDateChange={(s) => setExpDate(new Date(s))} label="计划日期" />
 
             <Text className="text-sm font-semibold text-gray-600 mb-1.5">关联试剂盒（可选）</Text>
             {kits.length === 0 ? (
