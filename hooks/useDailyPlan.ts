@@ -23,8 +23,9 @@ export function useDailyPlan() {
     setLoading(true);
     setError(null);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
       const today = new Date().toISOString().split("T")[0];
+      if (!today) { setPlan(null); return; }
+      const db = await SQLite.openDatabaseAsync("labflow.db");
 
       const row = await db.getFirstAsync<{ plan_json: string }>(
         "SELECT plan_json FROM daily_plans WHERE date = ?",
@@ -68,16 +69,20 @@ export function useDailyPlan() {
         setPlan(result.plan);
 
         // 保存到数据库
-        const db = await SQLite.openDatabaseAsync("labflow.db");
-        const today = new Date().toISOString().split("T")[0];
-        await db.runAsync(
-          `INSERT INTO daily_plans (date, plan_json)
-           VALUES (?, ?)
-           ON CONFLICT(date) DO UPDATE SET
-             plan_json = excluded.plan_json,
-             updated_at = datetime('now','localtime')`,
-          [today, JSON.stringify(result.plan)]
-        );
+        try {
+          const db = await SQLite.openDatabaseAsync("labflow.db");
+          const today = new Date().toISOString().split("T")[0];
+          if (today) {
+            await db.runAsync(
+              `INSERT INTO daily_plans (date, plan_json)
+               VALUES (?, ?)
+               ON CONFLICT(date) DO UPDATE SET
+                 plan_json = excluded.plan_json,
+                 updated_at = datetime('now','localtime')`,
+              [today, JSON.stringify(result.plan)]
+            );
+          }
+        } catch { /* 保存到本地失败不影响使用 */ }
 
         return result.plan;
       } catch (err: any) {
@@ -92,9 +97,13 @@ export function useDailyPlan() {
 
   // ── 清除今日规划 ──
   const clearPlan = useCallback(async () => {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
-    const today = new Date().toISOString().split("T")[0];
-    await db.runAsync("DELETE FROM daily_plans WHERE date = ?", [today]);
+    try {
+      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const today = new Date().toISOString().split("T")[0];
+      if (today) {
+        await db.runAsync("DELETE FROM daily_plans WHERE date = ?", [today]);
+      }
+    } catch { /* 静默处理 */ }
     setPlan(null);
     setError(null);
   }, []);
