@@ -32,14 +32,14 @@ async function initDatabase(): Promise<void> {
     await db.execAsync("PRAGMA journal_mode = WAL;");
     await db.execAsync("PRAGMA foreign_keys = ON;");
 
-    // 按顺序执行所有建表语句
+    // 按顺序执行所有建表语句（过滤空值以防模块加载顺序问题）
     for (const stmt of ALL_CREATE_STATEMENTS) {
-      await db.execAsync(stmt);
+      if (stmt) await db.execAsync(stmt);
     }
 
     // 运行迁移（允许失败 — 列可能已存在）
     for (const stmt of ALL_MIGRATIONS) {
-      try { await db.execAsync(stmt); } catch { /* 列已存在 */ }
+      if (stmt) { try { await db.execAsync(stmt); } catch { /* 列已存在 */ } }
     }
 
     // 种子数据（仅当 sop_steps 表为空时）

@@ -131,46 +131,11 @@ CREATE INDEX IF NOT EXISTS idx_records_exp      ON records(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_daily_plans_date ON daily_plans(date);
 `;
 
-// ─── 全部建表语句（按依赖顺序） ──────────────────────────────
+// ─── 全部建表语句（按依赖顺序） — 定义在所有 CREATE_* 之后 ──
+// 见文件末尾
 
-export const ALL_CREATE_STATEMENTS = [
-  CREATE_PROJECTS,
-  CREATE_TODOS,
-  CREATE_EXPERIMENTS,
-  CREATE_SOP_STEPS,
-  CREATE_RECORDS,
-  CREATE_DAILY_PLANS,
-  CREATE_KITS,
-  CREATE_KIT_COMPONENTS,
-  CREATE_REACTION_TEMPLATES,
-  CREATE_USAGE_LOGS,
-  CREATE_EXPERIMENT_TEMPLATES,
-  CREATE_SAMPLES,
-  CREATE_SAMPLE_USAGE_LOGS,
-  CREATE_INDEXES,
-  CREATE_KIT_INDEXES,
-  CREATE_TEMPLATE_INDEXES,
-  CREATE_SAMPLE_INDEXES,
-  CREATE_RECORD_IMAGES,
-  CREATE_RECORD_IMAGE_INDEXES,
-];
-
-/** 建表后执行的迁移（允许失败 — 列可能已存在） */
-export const ALL_MIGRATIONS = MIGRATIONS;
-
-// ─── 种子数据：内置 SOP 模板 ─────────────────────────────────
-
-export const SEED_SOP_TEMPLATES = `
-INSERT OR IGNORE INTO sop_steps (id, experiment_id, step_num, title, description, duration_min, timer_required, completed)
-VALUES
-  (1, 0, 1, '准备试剂与耗材', '检查并准备所有需要的试剂、缓冲液和一次性耗材', 15, 0, 0),
-  (2, 0, 2, '样本前处理', '对样本进行离心、过滤或稀释等前处理操作', 20, 1, 0),
-  (3, 0, 3, '加样与反应', '按照实验方案向反应体系中加入样本和试剂', 10, 1, 0),
-  (4, 0, 4, '孵育', '在指定温度和时间条件下进行孵育反应', 60, 1, 0),
-  (5, 0, 5, '检测与读数', '使用仪器进行检测并记录原始数据', 15, 0, 0),
-  (6, 0, 6, '数据导出与清洗', '将原始数据导出并进行初步清洗整理', 20, 0, 0),
-  (7, 0, 7, '设备清理与维护', '清理实验台面，按要求维护仪器设备', 10, 0, 0);
-`;
+// ─── 种子数据：内置 SOP 模板 — 定义在文件末尾 ────────────
+// 见文件末尾
 
 // ─── 类型定义 ───────────────────────────────────────────────
 
@@ -529,4 +494,46 @@ CREATE TABLE IF NOT EXISTS record_images (
 
 export const CREATE_RECORD_IMAGE_INDEXES = `
 CREATE INDEX IF NOT EXISTS idx_record_img_record ON record_images(record_id);
+`;
+
+// ════════════════════════════════════════════════════════════
+// 聚合导出（必须在所有 CREATE_* 常量定义之后）
+// ════════════════════════════════════════════════════════════
+
+export const ALL_CREATE_STATEMENTS: readonly string[] = [
+  CREATE_PROJECTS,
+  CREATE_TODOS,
+  CREATE_EXPERIMENTS,
+  CREATE_SOP_STEPS,
+  CREATE_RECORDS,
+  CREATE_DAILY_PLANS,
+  CREATE_KITS,
+  CREATE_KIT_COMPONENTS,
+  CREATE_REACTION_TEMPLATES,
+  CREATE_USAGE_LOGS,
+  CREATE_EXPERIMENT_TEMPLATES,
+  CREATE_SAMPLES,
+  CREATE_SAMPLE_USAGE_LOGS,
+  CREATE_INDEXES,
+  CREATE_KIT_INDEXES,
+  CREATE_TEMPLATE_INDEXES,
+  CREATE_SAMPLE_INDEXES,
+  CREATE_RECORD_IMAGES,
+  CREATE_RECORD_IMAGE_INDEXES,
+];
+
+/** 建表后执行的迁移（允许失败 — 列可能已存在） */
+export const ALL_MIGRATIONS: readonly string[] = MIGRATIONS;
+
+/** 种子数据：内置 SOP 模板 */
+export const SEED_SOP_TEMPLATES = `
+INSERT OR IGNORE INTO sop_steps (id, experiment_id, step_num, title, description, duration_min, timer_required, completed)
+VALUES
+  (1, 0, 1, '准备试剂与耗材', '检查并准备所有需要的试剂、缓冲液和一次性耗材', 15, 0, 0),
+  (2, 0, 2, '样本前处理', '对样本进行离心、过滤或稀释等前处理操作', 20, 1, 0),
+  (3, 0, 3, '加样与反应', '按照实验方案向反应体系中加入样本和试剂', 10, 1, 0),
+  (4, 0, 4, '孵育', '在指定温度和时间条件下进行孵育反应', 60, 1, 0),
+  (5, 0, 5, '检测与读数', '使用仪器进行检测并记录原始数据', 15, 0, 0),
+  (6, 0, 6, '数据导出与清洗', '将原始数据导出并进行初步清洗整理', 20, 0, 0),
+  (7, 0, 7, '设备清理与维护', '清理实验台面，按要求维护仪器设备', 10, 0, 0);
 `;
