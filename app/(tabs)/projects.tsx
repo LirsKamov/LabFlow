@@ -16,10 +16,11 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { useFocusEffect } from "expo-router";
+import { useFocusEffect, router } from "expo-router";
 import * as SQLite from "expo-sqlite";
 import { useProjects, type ProjectWithStats } from "../../hooks/useProjects";
 import { useTodos } from "../../hooks/useTodos";
+import { getKitSummaries } from "../../services/inventoryService";
 import type { Todo } from "../../db/schema";
 
 // Android 需要显式启用 LayoutAnimation
@@ -158,6 +159,9 @@ export default function ProjectsScreen() {
   const [expKitId, setExpKitId] = useState<number | null>(null);
   const [kits, setKits] = useState<{ id: number; name: string }[]>([]);
 
+  // ── 试剂盒库存汇总 ──
+  const [kitSummary, setKitSummary] = useState({ count: 0, lowStock: 0, loading: true });
+
   // ── 下拉刷新 ──
   const [refreshing, setRefreshing] = useState(false);
 
@@ -165,6 +169,7 @@ export default function ProjectsScreen() {
   useFocusEffect(
     useCallback(() => {
       loadProjects();
+      loadKitSummary();
     }, [loadProjects])
   );
 
@@ -179,6 +184,7 @@ export default function ProjectsScreen() {
   const onRefresh = async () => {
     setRefreshing(true);
     await loadProjects();
+    await loadKitSummary();
     if (expandedId !== null) await loadTodos();
     setRefreshing(false);
   };
@@ -228,7 +234,7 @@ export default function ProjectsScreen() {
     }
   };
 
-  // ── 加载试剂盒列表 ──
+  // ── 加载试剂盒列表（供新建实验用） ──
   const loadKits = async () => {
     try {
       const db = await SQLite.openDatabaseAsync("labflow.db");
@@ -237,6 +243,20 @@ export default function ProjectsScreen() {
       );
       setKits(rows);
     } catch { /* 表可能尚不存在 */ }
+  };
+
+  // ── 加载试剂盒库存汇总 ──
+  const loadKitSummary = async () => {
+    try {
+      const allKits = await getKitSummaries();
+      setKitSummary({
+        count: allKits.length,
+        lowStock: allKits.filter((k) => k.overallHealth < 0.3).length,
+        loading: false,
+      });
+    } catch {
+      setKitSummary({ count: 0, lowStock: 0, loading: false });
+    }
   };
 
   // ── 打开新建实验 Modal ──
@@ -362,6 +382,38 @@ export default function ProjectsScreen() {
           <RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#2563eb"]} tintColor="#2563eb" />
         }
       >
+        {/* 试剂盒库存入口卡片 */}
+        {!kitSummary.loading && (
+          <TouchableOpacity
+            className="bg-white rounded-2xl p-5 mb-3 shadow-sm border border-gray-100 flex-row items-center"
+            activeOpacity={0.9}
+            onPress={() => router.push("/kit-inventory")}
+          >
+            <View className="w-11 h-11 rounded-2xl bg-amber-100 items-center justify-center mr-3">
+              <Ionicons name="cube-outline" size={22} color="#d97706" />
+            </View>
+            <View className="flex-1">
+              <Text className="text-base font-bold text-gray-900">试剂盒库存</Text>
+              <Text className="text-gray-400 text-xs mt-0.5">
+                {kitSummary.count} 个试剂盒
+                {kitSummary.lowStock > 0 && (
+                  <Text className="text-red-500 font-semibold"> · {kitSummary.lowStock} 个低库存</Text>
+                )}
+              </Text>
+            </View>
+            {kitSummary.lowStock > 0 ? (
+              <View className="bg-red-500 rounded-full w-6 h-6 items-center justify-center mr-2">
+                <Text className="text-white text-xs font-bold">{kitSummary.lowStock}</Text>
+              </View>
+            ) : kitSummary.count > 0 ? (
+              <View className="bg-emerald-100 rounded-full px-2.5 py-0.5 mr-2">
+                <Text className="text-emerald-700 text-xs font-semibold">充足</Text>
+              </View>
+            ) : null}
+            <Ionicons name="chevron-forward" size={18} color="#d1d5db" />
+          </TouchableOpacity>
+        )}
+
         {/* 骨架屏 */}
         {loading && projects.length === 0 && (
           <View>
