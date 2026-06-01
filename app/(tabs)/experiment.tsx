@@ -13,6 +13,7 @@ import {
   Alert,
   Modal,
   Pressable,
+  Switch,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -259,6 +260,17 @@ export default function ExperimentScreen() {
   const [expKitId, setExpKitId] = useState<number | null>(null);
   const [kits, setKits] = useState<{ id: number; name: string }[]>([]);
 
+  // ── 添加步骤 Modal ──
+  const [addStepVisible, setAddStepVisible] = useState(false);
+  const [stepTitle, setStepTitle] = useState("");
+  const [stepDesc, setStepDesc] = useState("");
+  const [stepDuration, setStepDuration] = useState("");
+  const [stepTimerRequired, setStepTimerRequired] = useState(true);
+
+  // ── 从试剂盒导入 Modal ──
+  const [kitImportVisible, setKitImportVisible] = useState(false);
+  const [kitImportData, setKitImportData] = useState<{ kitId: number; kitName: string; steps: { title: string; description: string; duration_min: number; timer_required: boolean }[] }[]>([]);
+
   // ── 下拉刷新 ──
   const [refreshing, setRefreshing] = useState(false);
 
@@ -418,6 +430,84 @@ export default function ExperimentScreen() {
       Alert.alert("错误", err.message ?? "创建失败");
     }
   };
+
+  // ── 添加 SOP 步骤 ──
+  const addSopStep = async () => {
+    const title = stepTitle.trim();
+    if (!title) { Alert.alert("提示", "请输入步骤标题"); return; }
+    if (!selectedExperiment) return;
+    try {
+      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const maxNum = await db.getFirstAsync<{ mx: number }>(
+        "SELECT COALESCE(MAX(step_num), 0) AS mx FROM sop_steps WHERE experiment_id = ?",
+        [selectedExperiment.id]
+      );
+      const nextNum = (maxNum?.mx ?? 0) + 1;
+      const dur = parseInt(stepDuration, 10);
+      await db.runAsync(
+        `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [selectedExperiment.id, nextNum, title, stepDesc.trim(), isNaN(dur) ? 0 : dur, stepTimerRequired ? 1 : 0]
+      );
+      setAddStepVisible(false);
+      setStepTitle(""); setStepDesc(""); setStepDuration(""); setStepTimerRequired(true);
+      await selectExperiment(selectedExperiment);
+    } catch (err: any) {
+      Alert.alert("错误", err.message ?? "添加失败");
+    }
+  };
+
+  // ── 加载试剂盒 SOP 供导入 ──
+  const loadKitSOPsForImport = async () => {
+    try {
+      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const allKits = await db.getAllAsync<{ id: number; name: string }>("SELECT id, name FROM kits ORDER BY name");
+      const result: typeof kitImportData = [];
+      for (const kit of allKits) {
+        const tmpls = await db.getAllAsync<{ sop_steps_json: string }>(
+          "SELECT sop_steps_json FROM reaction_templates WHERE kit_id = ? LIMIT 1", [kit.id]
+        );
+        if (tmpls.length > 0) {
+          try {
+            const steps = JSON.parse(tmpls[0].sop_steps_json || "[]");
+            if (Array.isArray(steps) && steps.length > 0) {
+              result.push({ kitId: kit.id, kitName: kit.name, steps });
+            }
+          } catch { /* parse error */ }
+        }
+      }
+      setKitImportData(result);
+      setKitImportVisible(true);
+    } catch (err: any) {
+      Alert.alert("错误", err.message ?? "加载失败");
+    }
+  };
+
+  // ── 从试剂盒导入步骤 ──
+  const importStepsFromKit = async (kitSteps: typeof kitImportData[0]) => {
+    if (!selectedExperiment) return;
+    try {
+      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const maxNum = await db.getFirstAsync<{ mx: number }>(
+        "SELECT COALESCE(MAX(step_num), 0) AS mx FROM sop_steps WHERE experiment_id = ?",
+        [selectedExperiment.id]
+      );
+      let nextNum = (maxNum?.mx ?? 0) + 1;
+      for (const s of kitSteps.steps) {
+        await db.runAsync(
+          `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [selectedExperiment.id, nextNum++, s.title, s.description || "", s.duration_min || 0, s.timer_required ? 1 : 0]
+        );
+      }
+      setKitImportVisible(false);
+      await selectExperiment(selectedExperiment);
+      Alert.alert("导入成功", `已从「${kitSteps.kitName}」导入 ${kitSteps.steps.length} 个步骤`);
+    } catch (err: any) {
+      Alert.alert("错误", err.message ?? "导入失败");
+    }
+  };
+
   // ════════════════════════════════════════════════════════════
   // 视图 2：实验详情
   // ════════════════════════════════════════════════════════════
@@ -544,31 +634,55 @@ export default function ExperimentScreen() {
               </TouchableOpacity>
             )}
           </View>
+
+          {/* 步骤导入入口 */}
+          <View className="flex-row mt-3 space-x-2">
+            <TouchableOpacity
+              className="flex-1 flex-row items-center justify-center bg-purple-50 border border-purple-200 py-2 rounded-lg"
+              onPress={() => router.push("/templates")}
+            >
+              <Ionicons name="document-text-outline" size={15} color="#7c3aed" />
+              <Text className="text-purple-700 text-xs font-semibold ml-1">从模板导入步骤</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              className="flex-1 flex-row items-center justify-center bg-teal-50 border border-teal-200 py-2 rounded-lg"
+              onPress={loadKitSOPsForImport}
+            >
+              <Ionicons name="cube-outline" size={15} color="#0d9488" />
+              <Text className="text-teal-700 text-xs font-semibold ml-1">从试剂盒导入</Text>
+            </TouchableOpacity>
+          </View>
         </View>
 
         {/* ── SOP 步骤列表 ── */}
-        <ScrollView
-          className="flex-1 px-4 pt-4"
-          showsVerticalScrollIndicator={false}
-        >
-          {loading && steps.length === 0 ? (
-            <View>
-              {[1, 2, 3].map((i) => (
-                <View
-                  key={i}
-                  className="bg-white rounded-2xl p-5 h-24 mb-3 opacity-50"
-                />
-              ))}
-            </View>
-          ) : steps.length === 0 ? (
-            <View className="items-center py-12">
-              <Ionicons name="list-outline" size={48} color="#d1d5db" />
-              <Text className="text-gray-400 mt-3">暂无实验步骤</Text>
-              <Text className="text-gray-300 text-sm mt-1">
-                请先为实验添加 SOP 步骤
-              </Text>
-            </View>
-          ) : (
+        <View className="flex-1">
+          <ScrollView
+            className="flex-1 px-4 pt-4"
+            showsVerticalScrollIndicator={false}
+          >
+            {loading && steps.length === 0 ? (
+              <View>
+                {[1, 2, 3].map((i) => (
+                  <View
+                    key={i}
+                    className="bg-white rounded-2xl p-5 h-24 mb-3 opacity-50"
+                  />
+                ))}
+              </View>
+            ) : steps.length === 0 ? (
+              <View className="items-center py-16">
+                <Ionicons name="list-outline" size={52} color="#d1d5db" />
+                <Text className="text-gray-400 mt-4 text-base font-medium">暂无步骤</Text>
+                <Text className="text-gray-300 text-sm mt-1">点击下方 + 添加实验步骤</Text>
+                <TouchableOpacity
+                  className="mt-4 bg-primary-600 px-6 py-2.5 rounded-xl flex-row items-center"
+                  onPress={() => setAddStepVisible(true)}
+                >
+                  <Ionicons name="add" size={18} color="white" />
+                  <Text className="text-white font-semibold ml-1">添加步骤</Text>
+                </TouchableOpacity>
+              </View>
+            ) : (
             steps.map((step, idx) => {
               const isCompleted = step.completed === 1;
               const isTimerActive =
@@ -755,7 +869,153 @@ export default function ExperimentScreen() {
           <View className="h-6" />
         </ScrollView>
 
-        {/* ── 库存扣减确认 Modal ── */}
+        {/* ── FAB 添加步骤 ── */}
+        <TouchableOpacity
+          className="absolute bottom-6 right-5 bg-primary-600 w-14 h-14 rounded-2xl items-center justify-center shadow-lg shadow-primary-400"
+          activeOpacity={0.85}
+          onPress={() => setAddStepVisible(true)}
+        >
+          <Ionicons name="add" size={28} color="white" />
+        </TouchableOpacity>
+      </View>
+
+      {/* ── 添加步骤 Modal ── */}
+      <Modal
+        visible={addStepVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setAddStepVisible(false)}
+      >
+        <Pressable
+          className="flex-1 bg-black/40 justify-end"
+          onPress={() => setAddStepVisible(false)}
+        >
+          <Pressable
+            className="bg-white rounded-t-3xl px-5 pt-6 pb-10 max-h-[85%]"
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View className="w-10 h-1 bg-gray-200 rounded-full self-center mb-5" />
+            <Text className="text-xl font-bold text-gray-900 mb-5">添加实验步骤</Text>
+
+            <ScrollView showsVerticalScrollIndicator={false}>
+              <Text className="text-sm font-semibold text-gray-600 mb-1.5">步骤标题 *</Text>
+              <TextInput
+                className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
+                placeholder="如：准备试剂与耗材"
+                placeholderTextColor="#d1d5db"
+                value={stepTitle}
+                onChangeText={setStepTitle}
+                autoFocus
+                maxLength={100}
+              />
+
+              <Text className="text-sm font-semibold text-gray-600 mb-1.5">操作描述</Text>
+              <TextInput
+                className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
+                placeholder="详细描述本步骤的操作内容..."
+                placeholderTextColor="#d1d5db"
+                value={stepDesc}
+                onChangeText={setStepDesc}
+                multiline
+                numberOfLines={3}
+                textAlignVertical="top"
+                maxLength={500}
+              />
+
+              <Text className="text-sm font-semibold text-gray-600 mb-1.5">预计时长（分钟）</Text>
+              <TextInput
+                className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-base text-gray-800 mb-4"
+                placeholder="如 30"
+                placeholderTextColor="#d1d5db"
+                value={stepDuration}
+                onChangeText={setStepDuration}
+                keyboardType="number-pad"
+                maxLength={5}
+              />
+
+              <View className="flex-row items-center justify-between mb-6">
+                <View>
+                  <Text className="text-sm font-semibold text-gray-600">需要计时</Text>
+                  <Text className="text-gray-400 text-xs mt-0.5">开启后将可启动倒计时</Text>
+                </View>
+                <Switch
+                  value={stepTimerRequired}
+                  onValueChange={setStepTimerRequired}
+                  trackColor={{ false: "#d1d5db", true: "#93c5fd" }}
+                  thumbColor={stepTimerRequired ? "#2563eb" : "#f4f3f4"}
+                />
+              </View>
+            </ScrollView>
+
+            <View className="flex-row space-x-3">
+              <TouchableOpacity
+                className="flex-1 bg-gray-100 py-3.5 rounded-xl items-center"
+                onPress={() => setAddStepVisible(false)}
+              >
+                <Text className="text-gray-600 font-semibold">取消</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                className="flex-1 bg-primary-600 py-3.5 rounded-xl items-center shadow-sm shadow-primary-300"
+                onPress={addSopStep}
+              >
+                <Text className="text-white font-semibold">添加步骤</Text>
+              </TouchableOpacity>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── 从试剂盒导入 Modal ── */}
+      <Modal
+        visible={kitImportVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setKitImportVisible(false)}
+      >
+        <Pressable
+          className="flex-1 bg-black/40 justify-end"
+          onPress={() => setKitImportVisible(false)}
+        >
+          <Pressable
+            className="bg-white rounded-t-3xl px-5 pt-6 pb-10 max-h-[75%]"
+            onPress={(e) => e.stopPropagation()}
+          >
+            <View className="w-10 h-1 bg-gray-200 rounded-full self-center mb-5" />
+            <Text className="text-xl font-bold text-gray-900 mb-2">从试剂盒导入步骤</Text>
+            <Text className="text-gray-400 text-sm mb-4">选择已解析的试剂盒，导入其 SOP 步骤</Text>
+
+            <ScrollView showsVerticalScrollIndicator={false} className="flex-1">
+              {kitImportData.length === 0 ? (
+                <View className="items-center py-8">
+                  <Ionicons name="cube-outline" size={40} color="#d1d5db" />
+                  <Text className="text-gray-400 mt-3">暂无可导入的试剂盒</Text>
+                  <Text className="text-gray-300 text-xs mt-1">请先在试剂盒页面解析说明书</Text>
+                </View>
+              ) : (
+                kitImportData.map((kit) => (
+                  <TouchableOpacity
+                    key={kit.kitId}
+                    className="bg-gray-50 rounded-xl p-4 mb-3 flex-row items-center"
+                    activeOpacity={0.8}
+                    onPress={() => importStepsFromKit(kit)}
+                  >
+                    <View className="w-10 h-10 rounded-xl bg-teal-100 items-center justify-center mr-3">
+                      <Ionicons name="cube" size={20} color="#0d9488" />
+                    </View>
+                    <View className="flex-1">
+                      <Text className="font-semibold text-gray-800 text-sm">{kit.kitName}</Text>
+                      <Text className="text-gray-400 text-xs mt-0.5">{kit.steps.length} 个步骤</Text>
+                    </View>
+                    <Ionicons name="download-outline" size={20} color="#0d9488" />
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ── 库存扣减确认 Modal ── */}
         {deductionModal && (
           <View className="absolute inset-0 bg-black/40 justify-center items-center px-5">
             <View className="bg-white rounded-2xl p-5 w-full max-h-[70%]">
