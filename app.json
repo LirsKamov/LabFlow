@@ -42,13 +42,6 @@
     },
     "plugins": [
       "expo-router",
-      [
-        "expo-notifications",
-        {
-          "icon": "./assets/notification-icon.png",
-          "color": "#1e40af"
-        }
-      ],
       "expo-font"
     ],
     "experiments": {
