@@ -500,25 +500,33 @@ CREATE INDEX IF NOT EXISTS idx_record_img_record ON record_images(record_id);
 // 聚合导出（必须在所有 CREATE_* 常量定义之后）
 // ════════════════════════════════════════════════════════════
 
+// 建表顺序严格按外键依赖层级排列：
+//   L0 无FK → L1 依赖L0 → L2 依赖L0+L1 → L3 依赖L0+L1+L2
+//   索引放在所有表之后
 export const ALL_CREATE_STATEMENTS: readonly string[] = [
+  // ── L0: 无外键的基础表 ──
   CREATE_PROJECTS,
-  CREATE_TODOS,
-  CREATE_EXPERIMENTS,
-  CREATE_SOP_STEPS,
-  CREATE_RECORDS,
-  CREATE_DAILY_PLANS,
   CREATE_KITS,
-  CREATE_KIT_COMPONENTS,
-  CREATE_REACTION_TEMPLATES,
-  CREATE_USAGE_LOGS,
-  CREATE_EXPERIMENT_TEMPLATES,
-  CREATE_SAMPLES,
-  CREATE_SAMPLE_USAGE_LOGS,
+  CREATE_DAILY_PLANS,
+  // ── L1: 仅依赖 L0 ──
+  CREATE_TODOS,              // FK → projects
+  CREATE_KIT_COMPONENTS,     // FK → kits
+  // ── L2: 依赖 L0 + L1 ──
+  CREATE_REACTION_TEMPLATES, // FK → kits
+  CREATE_EXPERIMENTS,        // FK → projects, kits, reaction_templates
+  CREATE_SAMPLES,            // FK → projects, experiments
+  // ── L3: 依赖 L0 + L1 + L2 ──
+  CREATE_SOP_STEPS,          // FK → experiments
+  CREATE_RECORDS,            // FK → experiments
+  CREATE_USAGE_LOGS,         // FK → kits, experiments, kit_components
+  CREATE_EXPERIMENT_TEMPLATES,// FK → experiments, kits, reaction_templates
+  CREATE_SAMPLE_USAGE_LOGS,  // FK → samples, experiments
+  CREATE_RECORD_IMAGES,      // FK → records
+  // ── 索引（最后创建） ──
   CREATE_INDEXES,
   CREATE_KIT_INDEXES,
   CREATE_TEMPLATE_INDEXES,
   CREATE_SAMPLE_INDEXES,
-  CREATE_RECORD_IMAGES,
   CREATE_RECORD_IMAGE_INDEXES,
 ];
 

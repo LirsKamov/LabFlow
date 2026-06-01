@@ -30,9 +30,11 @@ async function initDatabase(): Promise<void> {
 
     // 开启 WAL 模式提升并发性能
     await db.execAsync("PRAGMA journal_mode = WAL;");
-    await db.execAsync("PRAGMA foreign_keys = ON;");
 
-    // 按顺序执行所有建表语句（过滤空值以防模块加载顺序问题）
+    // 建表期间关闭外键约束，避免顺序依赖问题
+    await db.execAsync("PRAGMA foreign_keys = OFF;");
+
+    // 按依赖层级顺序执行所有建表语句（过滤空值以防模块加载顺序问题）
     for (const stmt of ALL_CREATE_STATEMENTS) {
       if (stmt) await db.execAsync(stmt);
     }
@@ -41,6 +43,9 @@ async function initDatabase(): Promise<void> {
     for (const stmt of ALL_MIGRATIONS) {
       if (stmt) { try { await db.execAsync(stmt); } catch { /* 列已存在 */ } }
     }
+
+    // 建表完成后重新开启外键约束
+    await db.execAsync("PRAGMA foreign_keys = ON;");
 
     // 种子数据（仅当 sop_steps 表为空时）
     const countResult = await db.getFirstAsync<{ cnt: number }>(
