@@ -44,16 +44,13 @@ async function initDatabase(): Promise<void> {
       if (stmt) { try { await db.execAsync(stmt); } catch { /* 列已存在 */ } }
     }
 
+    // 执行种子数据（如果有）
+    if (SEED_SOP_TEMPLATES) {
+      try { await db.execAsync(SEED_SOP_TEMPLATES); } catch { /* 种子数据已存在或外键不匹配 */ }
+    }
+
     // 建表完成后重新开启外键约束
     await db.execAsync("PRAGMA foreign_keys = ON;");
-
-    // 种子数据（仅当 sop_steps 表为空时）
-    const countResult = await db.getFirstAsync<{ cnt: number }>(
-      "SELECT COUNT(*) AS cnt FROM sop_steps"
-    );
-    if (countResult && countResult.cnt === 0) {
-      await db.execAsync(SEED_SOP_TEMPLATES);
-    }
 
     console.log("[LabFlow] 数据库初始化完成");
   } catch (error) {
