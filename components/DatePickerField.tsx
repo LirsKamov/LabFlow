@@ -2,11 +2,13 @@ import { useState } from "react";
 import { TouchableOpacity, Text, View } from "react-native";
 import DateTimePicker, { type DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import { Ionicons } from "@expo/vector-icons";
+import { toLocalDateString } from "../utils/date";
 
 interface Props {
-  date: Date;
+  date?: Date;
   onDateChange: (dateStr: string) => void;
   label?: string;
+  placeholder?: string;
 }
 
 /**
@@ -16,19 +18,21 @@ interface Props {
  *   const [expDate, setExpDate] = useState(new Date());
  *   <DatePickerField date={expDate} onDateChange={(s) => setExpDateStr(s)} label="计划日期" />
  */
-export default function DatePickerField({ date, onDateChange, label }: Props) {
+export default function DatePickerField({ date, onDateChange, label, placeholder = "选择日期" }: Props) {
   const [show, setShow] = useState(false);
 
   const handleChange = (_event: DateTimePickerEvent, selected?: Date) => {
     setShow(false);
     if (selected) {
-      onDateChange(selected.toISOString().split("T")[0]);
+      onDateChange(toLocalDateString(selected));
     }
   };
 
-  const dateStr = date.toLocaleDateString("zh-CN", {
-    year: "numeric", month: "2-digit", day: "2-digit",
-  });
+  const dateStr = date
+    ? date.toLocaleDateString("zh-CN", {
+        year: "numeric", month: "2-digit", day: "2-digit",
+      })
+    : placeholder;
 
   return (
     <View>
@@ -41,13 +45,13 @@ export default function DatePickerField({ date, onDateChange, label }: Props) {
         activeOpacity={0.7}
       >
         <Ionicons name="calendar-outline" size={18} color="#6b7280" style={{ marginRight: 8 }} />
-        <Text className="text-base text-gray-800 flex-1">{dateStr}</Text>
+        <Text className={`text-base flex-1 ${date ? "text-gray-800" : "text-gray-400"}`}>{dateStr}</Text>
         <Ionicons name="chevron-down" size={16} color="#d1d5db" />
       </TouchableOpacity>
 
       {show && (
         <DateTimePicker
-          value={date}
+          value={date ?? new Date()}
           mode="date"
           display="spinner"
           locale="zh-CN"

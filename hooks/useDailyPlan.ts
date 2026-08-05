@@ -1,6 +1,8 @@
-import { useState, useCallback } from "react";
-import * as SQLite from "expo-sqlite";
-import type { Experiment, Todo, DailyPlan as _DP } from "../db/schema";
+import { useState, useCallback, useRef } from "react";
+import { Alert } from "react-native";
+import { getDb } from "../db/database";
+import { todayLocal } from "../utils/date";
+import type { Experiment, Todo } from "../db/schema";
 import { generateDailyPlan, type DailyPlan } from "../services/llm";
 
 /**
@@ -17,15 +19,18 @@ export function useDailyPlan() {
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** 生成中标记（防双击并发计费） */
+  const generatingRef = useRef(false);
+  /** 最新已生成/加载的规划（供并发守卫返回） */
+  const planRef = useRef<DailyPlan | null>(null);
 
   // ── 从数据库加载今日规划 ──
   const loadTodayPlan = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const today = new Date().toISOString().split("T")[0];
-      if (!today) { setPlan(null); return; }
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const today = todayLocal();
+      const db = await getDb();
 
       const row = await db.getFirstAsync<{ plan_json: string }>(
         "SELECT plan_json FROM daily_plans WHERE date = ?",
@@ -36,15 +41,19 @@ export function useDailyPlan() {
         try {
           const parsed = JSON.parse(row.plan_json) as DailyPlan;
           setPlan(parsed);
+          planRef.current = parsed;
         } catch {
           setPlan(null);
+          planRef.current = null;
         }
       } else {
         setPlan(null);
+        planRef.current = null;
       }
     } catch (err) {
       console.error("[useDailyPlan] 加载失败:", err);
       setPlan(null);
+      planRef.current = null;
     } finally {
       setLoading(false);
     }
@@ -56,6 +65,9 @@ export function useDailyPlan() {
       experiments: Experiment[],
       todos: Todo[]
     ): Promise<DailyPlan | null> => {
+      // 并发保护：正在生成时直接返回当前已知规划，防止重复计费
+      if (generatingRef.current) return planRef.current;
+      generatingRef.current = true;
       setGenerating(true);
       setError(null);
       try {
@@ -67,28 +79,31 @@ export function useDailyPlan() {
         }
 
         setPlan(result.plan);
+        planRef.current = result.plan;
 
         // 保存到数据库
         try {
-          const db = await SQLite.openDatabaseAsync("labflow.db");
-          const today = new Date().toISOString().split("T")[0];
-          if (today) {
-            await db.runAsync(
-              `INSERT INTO daily_plans (date, plan_json)
-               VALUES (?, ?)
-               ON CONFLICT(date) DO UPDATE SET
-                 plan_json = excluded.plan_json,
-                 updated_at = datetime('now','localtime')`,
-              [today, JSON.stringify(result.plan)]
-            );
-          }
-        } catch { /* 保存到本地失败不影响使用 */ }
+          const db = await getDb();
+          const today = todayLocal();
+          await db.runAsync(
+            `INSERT INTO daily_plans (date, plan_json)
+             VALUES (?, ?)
+             ON CONFLICT(date) DO UPDATE SET
+               plan_json = excluded.plan_json,
+               updated_at = datetime('now','localtime')`,
+            [today, JSON.stringify(result.plan)]
+          );
+        } catch (err) {
+          console.error("[useDailyPlan] 保存规划失败:", err);
+          Alert.alert("保存失败", "规划已生成但保存失败，请检查存储空间");
+        }
 
         return result.plan;
       } catch (err: any) {
         setError(err.message ?? "生成失败");
         return null;
       } finally {
+        generatingRef.current = false;
         setGenerating(false);
       }
     },
@@ -98,14 +113,16 @@ export function useDailyPlan() {
   // ── 清除今日规划 ──
   const clearPlan = useCallback(async () => {
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const today = new Date().toISOString().split("T")[0];
-      if (today) {
-        await db.runAsync("DELETE FROM daily_plans WHERE date = ?", [today]);
-      }
-    } catch { /* 静默处理 */ }
-    setPlan(null);
-    setError(null);
+      const db = await getDb();
+      const today = todayLocal();
+      await db.runAsync("DELETE FROM daily_plans WHERE date = ?", [today]);
+      setPlan(null);
+      planRef.current = null;
+      setError(null);
+    } catch (err) {
+      console.error("[useDailyPlan] 清除失败:", err);
+      Alert.alert("清除失败", "清除今日规划失败，请重试");
+    }
   }, []);
 
   return {

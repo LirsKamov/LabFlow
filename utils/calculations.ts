@@ -1,7 +1,18 @@
 /**
  * LabFlow 实验计算工具函数
  *
- * 提供常用生化/分子生物学计算，每个函数含单元测试示例注释。
+ * 提供常用生化/分子生物学计算的纯函数库：
+ *  - 摩尔浓度换算 / 稀释计算 / PCR 体系配置 / NanoDrop 浓度
+ *  - DNA 拷贝数 / Tm / GC 含量 / 细胞计数 / 传代 / 蛋白质浓度 / 统计
+ *
+ * 输入约定：非法输入（NaN / Infinity / 非正除数 / 负值等）统一返回 NaN
+ * （或含 NaN 字段的结果对象），由调用方（tools.tsx 等）检测 isFinite 后
+ * 显示"输入无效"提示，绝不静默返回误导性数值。
+ *
+ * 单位约定（勿混淆）：
+ *  - calcMolarity 的 volumeML 参数单位是【mL】（函数内部换算为 L）
+ *  - calcSoluteMass 的 volume 参数单位是【L】（直接参与计算）
+ *  两者单位不同，调用时务必确认传入值。
  */
 
 // ════════════════════════════════════════════════════════════
@@ -12,6 +23,8 @@
  * 从溶质质量计算摩尔浓度
  *   C(mol/L) = mass(g) / (MW(g/mol) × V(L))
  *
+ * @param volumeML 体积，单位【mL】（注意：与 calcSoluteMass 的 volume 单位 L 不同）
+ *
  * @example
  *   calcMolarity(58.44, 58.44, 1000)  // NaCl: 1M in 1L → 1.000
  *   calcMolarity(5.844, 58.44, 100)   // → 1.000
@@ -21,7 +34,9 @@ export function calcMolarity(
   molarMass: number,
   volumeML: number
 ): number {
-  if (molarMass <= 0 || volumeML <= 0) return 0;
+  if (!Number.isFinite(massGram) || !Number.isFinite(molarMass) || !Number.isFinite(volumeML)) return NaN;
+  // 负质量 / 非正体积 / 非正摩尔质量 → 无物理意义，返回 NaN
+  if (massGram < 0 || volumeML <= 0 || molarMass <= 0) return NaN;
   const volumeL = volumeML / 1000; // mL → L
   return Number(((massGram / molarMass) / volumeL).toFixed(4));
 }
@@ -29,6 +44,8 @@ export function calcMolarity(
 /**
  * 计算配制溶液所需溶质质量
  *   mass(g) = MW(g/mol) × C(mol/L) × V(L)
+ *
+ * @param volume 体积，单位【L】（注意：与 calcMolarity 的 volumeML 单位 mL 不同）
  *
  * @example
  *   calcSoluteMass(58.44, 1, 0.5)  // → 29.22 (g NaCl 配 0.5L 1M)
@@ -38,6 +55,8 @@ export function calcSoluteMass(
   concentration: number,
   volume: number
 ): number {
+  if (!Number.isFinite(molarMass) || !Number.isFinite(concentration) || !Number.isFinite(volume)) return NaN;
+  if (molarMass < 0 || concentration < 0 || volume < 0) return NaN;
   return molarMass * concentration * volume;
 }
 
@@ -48,17 +67,25 @@ export function calcSoluteMass(
 /**
  * 稀释计算
  *
+ * 非法输入（非正浓度/体积）以及目标浓度高于母液浓度（targetConc > stockConc，
+ * 溶剂体积为负，无法配制）时，两个字段返回 NaN，调用方提示"输入无效"。
+ *
  * @example
  *   calcDilution(10, 2, 100)  // → { stockVolume: 20, solventVolume: 80 }
  *   calcDilution(100, 25, 200) // → { stockVolume: 50, solventVolume: 150 }
+ *   calcDilution(2, 10, 100)  // 目标浓度 > 母液浓度 → NaN
  */
 export function calcDilution(
   stockConc: number,
   targetConc: number,
   targetVolume: number
 ): { stockVolume: number; solventVolume: number } {
-  if (stockConc <= 0) return { stockVolume: 0, solventVolume: 0 };
+  const invalid = !Number.isFinite(stockConc) || !Number.isFinite(targetConc) || !Number.isFinite(targetVolume)
+    || stockConc <= 0 || targetConc <= 0 || targetVolume <= 0;
+  if (invalid) return { stockVolume: NaN, solventVolume: NaN };
   const stockVolume = (targetConc * targetVolume) / stockConc;
+  // 需要量超过目标体积（目标浓度 > 母液浓度）→ 无法稀释，返回 NaN
+  if (stockVolume > targetVolume) return { stockVolume: NaN, solventVolume: NaN };
   return {
     stockVolume: Number(stockVolume.toFixed(4)),
     solventVolume: Number((targetVolume - stockVolume).toFixed(4)),
@@ -112,6 +139,9 @@ export interface PCRMixResult {
  * @param numSamples      样品数量
  * @param components      组分列表（含 ratio 比例，以 100 μL 为基准）
  *
+ * 非法输入：reactionVolume <= 0 或 numSamples <= 0（或非有限值）时
+ * 返回 reactionVolume / h2oVolume = NaN、空组分数组的结果，调用方提示"输入无效"。
+ *
  * @example
  *   calcPCRMix(50, 8, DEFAULT_PCR_COMPONENTS)
  *   // → perTube: Buffer 5μL, dNTPs 4μL, ... ddH₂O 补足
@@ -122,6 +152,16 @@ export function calcPCRMix(
   numSamples: number,
   components: PCRComponent[] = DEFAULT_PCR_COMPONENTS
 ): PCRMixResult {
+  if (!Number.isFinite(reactionVolume) || !Number.isFinite(numSamples) || reactionVolume <= 0 || numSamples <= 0) {
+    return {
+      reactionVolume: NaN,
+      numSamples,
+      totalTubes: NaN,
+      perTube: [],
+      masterMix: [],
+      h2oVolume: NaN,
+    };
+  }
   const scale = reactionVolume / 100; // 默认 ratio 基于 100 μL
   const totalTubes = numSamples + 1;  // +1 管余量
 
@@ -210,13 +250,15 @@ export function purityAssessment(a260a280: number): {
 // 保留原有函数（向后兼容）
 // ════════════════════════════════════════════════════════════
 
-/** g/L → mol/L */
+/** g/L → mol/L（molarMass <= 0 时返回 NaN，防除零） */
 export function gPerLToMolar(concentrationGL: number, molarMass: number): number {
+  if (!Number.isFinite(concentrationGL) || !Number.isFinite(molarMass) || molarMass <= 0) return NaN;
   return concentrationGL / molarMass;
 }
 
-/** mol/L → g/L */
+/** mol/L → g/L（非法输入返回 NaN） */
 export function molarToGPerL(molarity: number, molarMass: number): number {
+  if (!Number.isFinite(molarity) || !Number.isFinite(molarMass)) return NaN;
   return molarity * molarMass;
 }
 
@@ -237,7 +279,9 @@ export function nMToMicroM(value: number): number {
 
 // ─── DNA 拷贝数 / Tm / GC ────────────────────────────────────
 
+/** DNA 拷贝数（fragmentLen <= 0 或非有限值时返回 NaN，防除零得 Infinity） */
 export function calcCopyNumber(dnaMassNg: number, fragmentLen: number): number {
+  if (!Number.isFinite(dnaMassNg) || !Number.isFinite(fragmentLen) || fragmentLen <= 0) return NaN;
   return (dnaMassNg * 6.022e23) / (fragmentLen * 660 * 1e9);
 }
 
@@ -259,11 +303,17 @@ export function calcGCContent(sequence: string): number {
 
 // ─── 细胞培养 ────────────────────────────────────────────────
 
+/** 细胞计数（计数含 NaN / 稀释倍数非正 / 体积非法时返回 NaN，防误算） */
 export function calcCellCount(
   counts: [number, number, number, number],
   dilution: number = 1,
   volumeML: number = 1
 ): { concentration: number; totalCells: number } {
+  if (counts.some((c) => !Number.isFinite(c))
+    || !Number.isFinite(dilution) || dilution <= 0
+    || !Number.isFinite(volumeML) || volumeML < 0) {
+    return { concentration: NaN, totalCells: NaN };
+  }
   const avgCount = counts.reduce((a, b) => a + b, 0) / 4;
   const concentration = avgCount * dilution * 1e4;
   return {
@@ -272,11 +322,16 @@ export function calcCellCount(
   };
 }
 
+/** 传代计算（currentConc <= 0 除零时返回 NaN） */
 export function calcPassage(
   currentConc: number,
   targetConc: number,
   targetVolume: number
 ): { cellSuspensionML: number; freshMediumML: number } {
+  if (!Number.isFinite(currentConc) || !Number.isFinite(targetConc) || !Number.isFinite(targetVolume)
+    || currentConc <= 0 || targetConc <= 0 || targetVolume <= 0) {
+    return { cellSuspensionML: NaN, freshMediumML: NaN };
+  }
   const cellSuspensionML = (targetConc * targetVolume) / currentConc;
   return {
     cellSuspensionML: Number(cellSuspensionML.toFixed(2)),
@@ -312,12 +367,15 @@ export function calcRPD(val1: number, val2: number): number {
 
 // ─── 蛋白质浓度 ──────────────────────────────────────────────
 
+/** 蛋白质浓度（斜率 slope = 0 除零时返回 NaN） */
 export function calcProteinConc(
   absorbance: number,
   slope: number,
   intercept: number,
   dilution: number = 1
 ): number {
+  if (!Number.isFinite(absorbance) || !Number.isFinite(slope) || !Number.isFinite(intercept) || !Number.isFinite(dilution)) return NaN;
+  if (slope === 0 || dilution <= 0) return NaN;
   return Number((((absorbance - intercept) / slope) * dilution).toFixed(3));
 }
 

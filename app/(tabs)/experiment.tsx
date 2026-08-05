@@ -1,3 +1,9 @@
+/**
+ * 实验执行页（列表 + 详情）。
+ * 注：详情视图与列表视图共享 20+ 个 state（计时、备注、扣减、导入、新建实验等），
+ * 耦合极高且依赖多个 hook/服务层回调，拆分为 ExperimentDetail 组件回归风险较大，
+ * 故保持单文件实现（C1 不拆分）。
+ */
 import { useState, useCallback, useRef, useEffect } from "react";
 import {
   View,
@@ -18,10 +24,11 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect, router } from "expo-router";
-import * as SQLite from "expo-sqlite";
+import { getDb, withTransaction } from "../../db/database";
 import { useExperiment } from "../../hooks/useExperiment";
 import { useTimer } from "../../hooks/useTimer";
 import DatePickerField from "../../components/DatePickerField";
+import { toLocalDateString } from "../../utils/date";
 import { deductKitUsage, getDeductionPreview, type DeductionPreview } from "../../services/inventoryService";
 import type { Experiment, SopStep } from "../../db/schema";
 
@@ -123,6 +130,16 @@ function TimerDisplay({
   stepTitle: string;
   durationMin: number;
 }) {
+  const progressAnimRef = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.timing(progressAnimRef, {
+      toValue: Math.round(progress * 100),
+      duration: 300,
+      useNativeDriver: false,
+    }).start();
+  }, [progress, progressAnimRef]);
+
   // 未启动状态
   if (!isRunning && !isPaused && remainingSeconds === 0) {
     return (
@@ -168,7 +185,10 @@ function TimerDisplay({
         <Animated.View
           className="h-full rounded-full"
           style={{
-            width: `${Math.round(progress * 100)}%`,
+            width: progressAnimRef.interpolate({
+              inputRange: [0, 100],
+              outputRange: ["0%", "100%"],
+            }),
             backgroundColor: isRunning ? "#10b981" : "#f59e0b",
           }}
         />
@@ -260,6 +280,9 @@ export default function ExperimentScreen() {
   const [expDate, setExpDate] = useState(new Date());
   const [expKitId, setExpKitId] = useState<number | null>(null);
   const [kits, setKits] = useState<{ id: number; name: string }[]>([]);
+  const [kitsError, setKitsError] = useState<string | null>(null);
+  const [expTemplateId, setExpTemplateId] = useState<number | null>(null);
+  const [expTemplates, setExpTemplates] = useState<{ id: number; template_name: string }[]>([]);
 
   // ── 添加步骤 Modal ──
   const [addStepVisible, setAddStepVisible] = useState(false);
@@ -309,8 +332,10 @@ export default function ExperimentScreen() {
   };
 
   // ── 返回列表 ──
-  const handleBack = () => {
+  const handleBack = async () => {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    // 停止仍在运行的计时器（含取消已安排的通知），避免后台继续响铃
+    await timer.resetTimer();
     deselectExperiment();
   };
 
@@ -327,39 +352,94 @@ export default function ExperimentScreen() {
 
   // ── 保存备注 ──
   const saveNotes = async (stepId: number) => {
-    const notes = notesDraft[stepId] ?? "";
-    await updateStepNotes(stepId, notes);
+    try {
+      const notes = notesDraft[stepId] ?? "";
+      await updateStepNotes(stepId, notes);
+    } catch (err: any) {
+      console.error("[Experiment] 保存备注失败:", err);
+      Alert.alert("保存失败", err?.message ?? "备注未能保存，请重试");
+    }
+  };
+
+  // ── 状态切换（失败时提示） ──
+  const handleStatusChange = async (expId: number, status: Experiment["status"]) => {
+    try {
+      await updateExperimentStatus(expId, status);
+    } catch (err: any) {
+      console.error("[Experiment] 状态更新失败:", err);
+      Alert.alert("操作失败", err?.message ?? "状态更新失败，请重试");
+    }
   };
 
   // ── 完成实验（含库存扣减） ──
   const handleComplete = async (exp: Experiment) => {
-    if (exp.kit_id && exp.reaction_template_id) {
-      const preview = await getDeductionPreview(exp.kit_id, exp.reaction_template_id, 1);
-      if (preview.length > 0) {
-        setDeductionPreview(preview);
-        setDeductionReactionCount("1");
-        setDeductionModal(true);
-        return;
+    try {
+      if (exp.kit_id && exp.reaction_template_id) {
+        const preview = await getDeductionPreview(exp.kit_id, exp.reaction_template_id, 1);
+        if (preview.length > 0) {
+          setDeductionPreview(preview);
+          setDeductionReactionCount("1");
+          setDeductionModal(true);
+          return;
+        }
       }
+      await updateExperimentStatus(exp.id, "completed");
+    } catch (err: any) {
+      console.error("[Experiment] 完成实验失败:", err);
+      Alert.alert("操作失败", err?.message ?? "完成实验失败，请重试");
     }
-    await updateExperimentStatus(exp.id, "completed");
   };
 
   const handleConfirmDeduction = async () => {
     const exp = selectedExperiment;
     if (!exp?.kit_id || !exp?.reaction_template_id) return;
-    const count = parseInt(deductionReactionCount) || 1;
-    const result = await deductKitUsage(exp.kit_id, exp.id, count, exp.reaction_template_id);
-    if (result.success) {
-      if (result.lowComponents?.length) {
-        Alert.alert("库存预警", `以下组分库存不足：${result.lowComponents.join("、")}`);
-      }
-      await updateExperimentStatus(exp.id, "completed");
-    } else {
-      Alert.alert("扣减失败", result.error ?? "请重试");
+    const count = parseInt(deductionReactionCount, 10);
+    if (!Number.isFinite(count) || count <= 0) {
+      Alert.alert("提示", "请输入有效的反应管数（正整数）");
+      return;
     }
-    setDeductionModal(false);
+    try {
+      const result = await deductKitUsage(exp.kit_id, exp.id, count, exp.reaction_template_id);
+      if (result.success) {
+        if (result.lowComponents?.length) {
+          Alert.alert("库存预警", `以下组分库存不足：${result.lowComponents.join("、")}`);
+        }
+        await updateExperimentStatus(exp.id, "completed");
+      } else {
+        Alert.alert("扣减失败", result.error ?? "请重试");
+      }
+      setDeductionModal(false);
+    } catch (err: any) {
+      console.error("[Experiment] 扣减失败:", err);
+      Alert.alert("操作失败", err?.message ?? "扣减失败，请重试");
+      setDeductionModal(false);
+    }
   };
+
+  // ── 扣减预览随管数变化实时刷新（保证显示与真实扣减一致） ──
+  useEffect(() => {
+    const kitId = selectedExperiment?.kit_id;
+    const templateId = selectedExperiment?.reaction_template_id;
+    if (!deductionModal || !kitId || !templateId) return;
+    const n = parseInt(deductionReactionCount, 10);
+    if (!Number.isFinite(n) || n <= 0) {
+      setDeductionPreview([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const preview = await getDeductionPreview(kitId, templateId, n);
+        if (!cancelled) setDeductionPreview(preview);
+      } catch (err: any) {
+        console.error("[Experiment] 扣减预览失败:", err);
+        if (!cancelled) Alert.alert("操作失败", err?.message ?? "预览加载失败");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [deductionModal, deductionReactionCount, selectedExperiment?.kit_id, selectedExperiment?.reaction_template_id]);
 
   // ── 开始/暂停/恢复/重置计时 ──
   const handleTimerStart = (step: SopStep) => {
@@ -395,12 +475,38 @@ export default function ExperimentScreen() {
   // ── 加载试剂盒列表 ──
   const loadKits = async () => {
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const rows = await db.getAllAsync<{ id: number; name: string }>(
         "SELECT id, name FROM kits ORDER BY name"
       );
       setKits(rows);
-    } catch { /* 表可能尚不存在 */ }
+      setKitsError(null);
+    } catch (err: any) {
+      console.error("[Experiment] 加载试剂盒失败:", err);
+      setKitsError(err?.message ?? "试剂盒加载失败");
+    }
+  };
+
+  // ── 加载试剂盒的反应体系模板 ──
+  const loadKitTemplates = async (kitId: number | null) => {
+    if (!kitId) {
+      setExpTemplates([]);
+      setExpTemplateId(null);
+      return;
+    }
+    try {
+      const db = await getDb();
+      const rows = await db.getAllAsync<{ id: number; template_name: string }>(
+        "SELECT id, template_name FROM reaction_templates WHERE kit_id = ?",
+        [kitId]
+      );
+      setExpTemplates(rows);
+      setExpTemplateId(rows.length > 0 ? rows[0].id : null);
+    } catch (err: any) {
+      console.error("[Experiment] 加载反应体系模板失败:", err);
+      setExpTemplates([]);
+      setExpTemplateId(null);
+    }
   };
 
   // ── 打开新建实验 Modal ──
@@ -409,6 +515,9 @@ export default function ExperimentScreen() {
     setExpDesc("");
     setExpDate(new Date());
     setExpKitId(null);
+    setExpTemplateId(null);
+    setExpTemplates([]);
+    setKitsError(null);
     loadKits();
     setExpModalVisible(true);
   };
@@ -418,11 +527,11 @@ export default function ExperimentScreen() {
     const name = expName.trim();
     if (!name) { Alert.alert("提示", "请输入实验名称"); return; }
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       await db.runAsync(
-        `INSERT INTO experiments (kit_id, name, description, scheduled_date, status)
-         VALUES (?, ?, ?, ?, 'planned')`,
-        [expKitId, name, expDesc.trim(), expDate.toISOString().split("T")[0]]
+        `INSERT INTO experiments (kit_id, reaction_template_id, name, description, scheduled_date, status)
+         VALUES (?, ?, ?, ?, ?, 'planned')`,
+        [expKitId, expTemplateId, name, expDesc.trim(), toLocalDateString(expDate)]
       );
       setExpModalVisible(false);
       if (viewMode === "today") await loadTodayExperiments();
@@ -438,18 +547,20 @@ export default function ExperimentScreen() {
     if (!title) { Alert.alert("提示", "请输入步骤标题"); return; }
     if (!selectedExperiment) return;
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const maxNum = await db.getFirstAsync<{ mx: number }>(
-        "SELECT COALESCE(MAX(step_num), 0) AS mx FROM sop_steps WHERE experiment_id = ?",
-        [selectedExperiment.id]
-      );
-      const nextNum = (maxNum?.mx ?? 0) + 1;
+      const expId = selectedExperiment.id;
       const dur = parseInt(stepDuration, 10);
-      await db.runAsync(
-        `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [selectedExperiment.id, nextNum, title, stepDesc.trim(), isNaN(dur) ? 0 : dur, stepTimerRequired ? 1 : 0]
-      );
+      await withTransaction(async (db) => {
+        const maxNum = await db.getFirstAsync<{ mx: number }>(
+          "SELECT COALESCE(MAX(step_num), 0) AS mx FROM sop_steps WHERE experiment_id = ?",
+          [expId]
+        );
+        const nextNum = (maxNum?.mx ?? 0) + 1;
+        await db.runAsync(
+          `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [expId, nextNum, title, stepDesc.trim(), isNaN(dur) ? 0 : dur, stepTimerRequired ? 1 : 0]
+        );
+      });
       setAddStepVisible(false);
       setStepTitle(""); setStepDesc(""); setStepDuration(""); setStepTimerRequired(true);
       await selectExperiment(selectedExperiment);
@@ -461,8 +572,8 @@ export default function ExperimentScreen() {
   // ── 加载试剂盒 SOP 供导入 ──
   const loadKitSOPsForImport = async () => {
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const rows = await db.getAllAsync<{ id: number; kit_id: number; name: string; sop_steps_json: string }>(
+      const db = await getDb();
+      const rows = await db.getAllAsync<{ id: number; kit_id: number; kitName: string; sop_steps_json: string }>(
         "SELECT et.id, et.kit_id, k.name AS kitName, et.sop_steps_json FROM experiment_templates et JOIN kits k ON et.kit_id = k.id WHERE et.sop_steps_json IS NOT NULL AND et.sop_steps_json != '[]' AND et.tags = 'kit-sop'"
       );
       const result: typeof kitImportData = [];
@@ -471,15 +582,9 @@ export default function ExperimentScreen() {
       for (const row of rows) {
         try {
           const steps = JSON.parse(row.sop_steps_json);
-          if (Array.isArray(steps) && steps.length > 0) {
-            const kitName = await (async () => {
-              const kit = await db.getFirstAsync<{ name: string }>("SELECT name FROM kits WHERE id = ?", [row.kit_id]);
-              return kit?.name ?? "未知试剂盒";
-            })();
-            if (!seenKits.has(row.kit_id)) {
-              seenKits.add(row.kit_id);
-              result.push({ kitId: row.kit_id, kitName, steps });
-            }
+          if (Array.isArray(steps) && steps.length > 0 && !seenKits.has(row.kit_id)) {
+            seenKits.add(row.kit_id);
+            result.push({ kitId: row.kit_id, kitName: row.kitName || "未知试剂盒", steps });
           }
         } catch { /* parse error */ }
       }
@@ -494,19 +599,21 @@ export default function ExperimentScreen() {
   const importStepsFromKit = async (kitSteps: typeof kitImportData[0]) => {
     if (!selectedExperiment) return;
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const maxNum = await db.getFirstAsync<{ mx: number }>(
-        "SELECT COALESCE(MAX(step_num), 0) AS mx FROM sop_steps WHERE experiment_id = ?",
-        [selectedExperiment.id]
-      );
-      let nextNum = (maxNum?.mx ?? 0) + 1;
-      for (const s of kitSteps.steps) {
-        await db.runAsync(
-          `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [selectedExperiment.id, nextNum++, s.title, s.description || "", s.duration_min || 0, s.timer_required ? 1 : 0]
+      const expId = selectedExperiment.id;
+      await withTransaction(async (db) => {
+        const maxNum = await db.getFirstAsync<{ mx: number }>(
+          "SELECT COALESCE(MAX(step_num), 0) AS mx FROM sop_steps WHERE experiment_id = ?",
+          [expId]
         );
-      }
+        let nextNum = (maxNum?.mx ?? 0) + 1;
+        for (const s of kitSteps.steps) {
+          await db.runAsync(
+            `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [expId, nextNum++, s.title, s.description || "", s.duration_min || 0, s.timer_required ? 1 : 0]
+          );
+        }
+      });
       setKitImportVisible(false);
       await selectExperiment(selectedExperiment);
       Alert.alert("导入成功", `已从「${kitSteps.kitName}」导入 ${kitSteps.steps.length} 个步骤`);
@@ -545,7 +652,7 @@ export default function ExperimentScreen() {
               <Ionicons
                 name={statusCfg.icon}
                 size={22}
-                color={statusCfg.text.replace("text-", "#") === "text-emerald-700" ? "#059669" : "#3b82f6"}
+                color={statusCfg.text.startsWith("text-emerald") ? "#059669" : statusCfg.text.startsWith("text-amber") ? "#d97706" : statusCfg.text.startsWith("text-blue") ? "#2563eb" : statusCfg.text.startsWith("text-red") ? "#ef4444" : "#6b7280"}
               />
             </View>
             <View className="flex-1">
@@ -588,7 +695,7 @@ export default function ExperimentScreen() {
             {exp.status === "planned" && (
               <TouchableOpacity
                 className="flex-1 bg-emerald-600 py-2.5 rounded-xl items-center flex-row justify-center"
-                onPress={() => updateExperimentStatus(exp.id, "in_progress")}
+                onPress={() => handleStatusChange(exp.id, "in_progress")}
               >
                 <Ionicons name="play" size={16} color="white" />
                 <Text className="text-white font-semibold text-sm ml-1">
@@ -609,7 +716,7 @@ export default function ExperimentScreen() {
                 </TouchableOpacity>
                 <TouchableOpacity
                   className="flex-1 bg-amber-500 py-2.5 rounded-xl items-center flex-row justify-center"
-                  onPress={() => updateExperimentStatus(exp.id, "paused")}
+                  onPress={() => handleStatusChange(exp.id, "paused")}
                 >
                   <Ionicons name="pause-circle" size={16} color="white" />
                   <Text className="text-white font-semibold text-sm ml-1">
@@ -621,7 +728,7 @@ export default function ExperimentScreen() {
             {exp.status === "paused" && (
               <TouchableOpacity
                 className="flex-1 bg-emerald-600 py-2.5 rounded-xl items-center flex-row justify-center"
-                onPress={() => updateExperimentStatus(exp.id, "in_progress")}
+                onPress={() => handleStatusChange(exp.id, "in_progress")}
               >
                 <Ionicons name="play" size={16} color="white" />
                 <Text className="text-white font-semibold text-sm ml-1">
@@ -844,7 +951,6 @@ export default function ExperimentScreen() {
                           multiline
                           numberOfLines={3}
                           textAlignVertical="top"
-                          onBlur={() => saveNotes(step.id)}
                           onSubmitEditing={() => saveNotes(step.id)}
                           returnKeyType="done"
                         />
@@ -1023,38 +1129,43 @@ export default function ExperimentScreen() {
       </Modal>
 
       {/* ── 库存扣减确认 Modal ── */}
-        {deductionModal && (
-          <View className="absolute inset-0 bg-black/40 justify-center items-center px-5">
-            <View className="bg-white rounded-2xl p-5 w-full max-h-[70%]">
-              <Text className="text-lg font-bold text-gray-900 mb-2">确认库存扣减</Text>
-              <Text className="text-gray-500 text-sm mb-1">本次实验使用了试剂盒，请确认扣减用量：</Text>
-              <View className="flex-row items-center mb-3">
-                <Text className="text-gray-600 text-sm mr-2">反应管数：</Text>
-                <TextInput className="w-16 input-field text-sm text-center" value={deductionReactionCount} onChangeText={setDeductionReactionCount} keyboardType="number-pad" />
-              </View>
-              <ScrollView className="max-h-48 mb-4">
-                {deductionPreview.map((p, i) => (
-                  <View key={i} className="flex-row justify-between py-1.5 border-b border-gray-50">
-                    <Text className="text-xs text-gray-700 flex-1">{p.componentName}</Text>
-                    <Text className="text-xs text-gray-500 w-16 text-center">{p.perReaction}×{deductionReactionCount || "1"}={p.totalDeduct} {p.unit}</Text>
-                    <Text className={`text-xs w-16 text-right ${p.willBeLow ? "text-red-500" : "text-gray-400"}`}>
-                      →{p.afterDeduction} {p.unit}
-                    </Text>
-                  </View>
-                ))}
-              </ScrollView>
-              <View className="flex-row space-x-3">
-                <TouchableOpacity className="flex-1 bg-gray-100 py-3 rounded-xl items-center" onPress={() => setDeductionModal(false)}>
-                  <Text className="text-gray-600 font-semibold">跳过</Text>
-                </TouchableOpacity>
-                <TouchableOpacity className="flex-1 bg-primary-600 py-3 rounded-xl items-center" onPress={handleConfirmDeduction}>
-                  <Text className="text-white font-semibold">确认扣减并完成</Text>
-                </TouchableOpacity>
-              </View>
+      <Modal
+        visible={deductionModal}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setDeductionModal(false)}
+      >
+        <View className="flex-1 bg-black/40 justify-center items-center px-5">
+          <View className="bg-white rounded-2xl p-5 w-full max-h-[70%]">
+            <Text className="text-lg font-bold text-gray-900 mb-2">确认库存扣减</Text>
+            <Text className="text-gray-500 text-sm mb-1">本次实验使用了试剂盒，请确认扣减用量：</Text>
+            <View className="flex-row items-center mb-3">
+              <Text className="text-gray-600 text-sm mr-2">反应管数：</Text>
+              <TextInput className="w-16 input-field text-sm text-center" value={deductionReactionCount} onChangeText={setDeductionReactionCount} keyboardType="numeric" />
+            </View>
+            <ScrollView className="max-h-48 mb-4">
+              {deductionPreview.map((p, i) => (
+                <View key={i} className="flex-row justify-between py-1.5 border-b border-gray-50">
+                  <Text className="text-xs text-gray-700 flex-1">{p.componentName}</Text>
+                  <Text className="text-xs text-gray-500 w-16 text-center">{p.perReaction}×{deductionReactionCount || "1"}={p.totalDeduct} {p.unit}</Text>
+                  <Text className={`text-xs w-16 text-right ${p.willBeLow ? "text-red-500" : "text-gray-400"}`}>
+                    →{p.afterDeduction} {p.unit}
+                  </Text>
+                </View>
+              ))}
+            </ScrollView>
+            <View className="flex-row space-x-3">
+              <TouchableOpacity className="flex-1 bg-gray-100 py-3 rounded-xl items-center" onPress={() => setDeductionModal(false)}>
+                <Text className="text-gray-600 font-semibold">跳过</Text>
+              </TouchableOpacity>
+              <TouchableOpacity className="flex-1 bg-primary-600 py-3 rounded-xl items-center" onPress={handleConfirmDeduction}>
+                <Text className="text-white font-semibold">确认扣减并完成</Text>
+              </TouchableOpacity>
             </View>
           </View>
-        )}
-      </SafeAreaView>
+        </View>
+      </Modal>
+    </SafeAreaView>
     );
   }
 
@@ -1289,12 +1400,15 @@ export default function ExperimentScreen() {
 
             <Text className="text-sm font-semibold text-gray-600 mb-1.5">关联试剂盒（可选）</Text>
             {kits.length === 0 ? (
-              <Text className="text-gray-400 text-xs mb-4">暂无试剂盒</Text>
+              <Text className="text-gray-400 text-xs mb-4">{kitsError ?? "暂无试剂盒"}</Text>
             ) : (
               <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-4" style={{ maxHeight: 48 }}>
                 <TouchableOpacity
                   className={`px-3 py-2 rounded-lg mr-2 ${expKitId === null ? "bg-primary-100 border border-primary-300" : "bg-gray-100"}`}
-                  onPress={() => setExpKitId(null)}
+                  onPress={() => {
+                    setExpKitId(null);
+                    loadKitTemplates(null);
+                  }}
                 >
                   <Text className={`text-xs font-medium ${expKitId === null ? "text-primary-700" : "text-gray-500"}`}>不关联</Text>
                 </TouchableOpacity>
@@ -1302,12 +1416,32 @@ export default function ExperimentScreen() {
                   <TouchableOpacity
                     key={k.id}
                     className={`px-3 py-2 rounded-lg mr-2 ${expKitId === k.id ? "bg-primary-100 border border-primary-300" : "bg-gray-100"}`}
-                    onPress={() => setExpKitId(k.id)}
+                    onPress={() => {
+                      setExpKitId(k.id);
+                      loadKitTemplates(k.id);
+                    }}
                   >
                     <Text className={`text-xs font-medium ${expKitId === k.id ? "text-primary-700" : "text-gray-500"}`} numberOfLines={1}>{k.name}</Text>
                   </TouchableOpacity>
                 ))}
               </ScrollView>
+            )}
+
+            {expKitId !== null && expTemplates.length > 0 && (
+              <>
+                <Text className="text-sm font-semibold text-gray-600 mb-1.5">反应体系模板</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false} className="mb-4" style={{ maxHeight: 48 }}>
+                  {expTemplates.map((t) => (
+                    <TouchableOpacity
+                      key={t.id}
+                      className={`px-3 py-2 rounded-lg mr-2 ${expTemplateId === t.id ? "bg-primary-100 border border-primary-300" : "bg-gray-100"}`}
+                      onPress={() => setExpTemplateId(t.id)}
+                    >
+                      <Text className={`text-xs font-medium ${expTemplateId === t.id ? "text-primary-700" : "text-gray-500"}`} numberOfLines={1}>{t.template_name}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </ScrollView>
+              </>
             )}
 
             <View className="flex-row space-x-3 mt-2">

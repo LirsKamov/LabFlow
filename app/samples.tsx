@@ -1,4 +1,4 @@
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import {
   View, Text, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator,
   RefreshControl, Modal, Pressable, LayoutAnimation, Platform, UIManager,
@@ -33,6 +33,8 @@ function TypeBadge({ type }: { type: SampleType }) {
 export default function SamplesScreen() {
   const [samples, setSamples] = useState<SampleWithMeta[]>([]);
   const [search, setSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [activeType, setActiveType] = useState<SampleType | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -40,6 +42,7 @@ export default function SamplesScreen() {
   // Detail
   const [detailId, setDetailId] = useState<number | null>(null);
   const [detail, setDetail] = useState<SampleWithMeta | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [detailLogs, setDetailLogs] = useState<any[]>([]);
   const [detailLineage, setDetailLineage] = useState<any[]>([]);
   const [volDelta, setVolDelta] = useState("");
@@ -47,6 +50,9 @@ export default function SamplesScreen() {
   const [volExpId, setVolExpId] = useState<number | null>(null);
   const [volNote, setVolNote] = useState("");
   const [experiments, setExperiments] = useState<{ id: number; name: string; date: string }[]>([]);
+
+  // 详情请求序号：快速切换样品时丢弃过期响应
+  const detailSeqRef = useRef(0);
 
   // Edit
   const [editName, setEditName] = useState("");
@@ -67,17 +73,24 @@ export default function SamplesScreen() {
   const [newExpId, setNewExpId] = useState<number | null>(null);
   const [newNotes, setNewNotes] = useState("");
 
+  // 搜索 300ms 防抖：防抖期间不触发查询
+  useEffect(() => {
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => { if (searchTimerRef.current) clearTimeout(searchTimerRef.current); };
+  }, [search]);
+
   const load = useCallback(async () => {
     setLoading(true);
     try {
       let rows: SampleWithMeta[];
-      if (search.trim()) rows = await searchSamples(search);
+      if (debouncedSearch.trim()) rows = await searchSamples(debouncedSearch);
       else if (activeType) rows = await getSamplesByType(activeType);
       else rows = await getAllSamples();
       setSamples(rows);
     } catch (e) { console.error(e); }
     finally { setLoading(false); }
-  }, [search, activeType]);
+  }, [debouncedSearch, activeType]);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
   const onRefresh = async () => { setRefreshing(true); await load(); setRefreshing(false); };
@@ -85,15 +98,30 @@ export default function SamplesScreen() {
   // ── Open Detail ──
   const openDetail = async (id: number) => {
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    const seq = ++detailSeqRef.current;
     setDetailId(id);
-    const [d, logs, lineage, exps] = await Promise.all([
-      getSample(id), getSampleUsageLogs(id), getSampleLineage(id), getExperimentOptions(),
-    ]);
-    setDetail(d); setDetailLogs(logs); setDetailLineage(lineage); setExperiments(exps);
-    setEditName(d?.name ?? ""); setEditConc(d?.concentration ?? ""); setEditUnit(d?.concentration_unit ?? "");
-    setEditLoc(d?.location_json ?? ""); setEditNotes(d?.notes ?? "");
+    setDetailLoading(true);
+    try {
+      const [d, logs, lineage, exps] = await Promise.all([
+        getSample(id), getSampleUsageLogs(id), getSampleLineage(id), getExperimentOptions(),
+      ]);
+      if (seq !== detailSeqRef.current) return; // 已有更新的请求，丢弃过期响应
+      setDetail(d); setDetailLogs(logs); setDetailLineage(lineage); setExperiments(exps);
+      setEditName(d?.name ?? ""); setEditConc(d?.concentration ?? ""); setEditUnit(d?.concentration_unit ?? "");
+      setEditLoc(d?.location_json ?? ""); setEditNotes(d?.notes ?? "");
+    } catch (e: any) {
+      if (seq === detailSeqRef.current) {
+        Alert.alert("加载失败", e?.message ?? "请重试");
+        setDetailId(null);
+      }
+    } finally {
+      if (seq === detailSeqRef.current) setDetailLoading(false);
+    }
   };
-  const closeDetail = () => { LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut); setDetailId(null); setDetail(null); };
+  const closeDetail = () => {
+    LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    setDetailId(null); setDetail(null); setDetailLoading(false);
+  };
 
   // ── Volume adjust ──
   const handleVolumeChange = async () => {
@@ -102,8 +130,14 @@ export default function SamplesScreen() {
     if (isNaN(delta) || delta <= 0) { Alert.alert("提示", "请输入有效数量"); return; }
     const actualDelta = volOp === "use" ? -delta : delta;
     try {
-      await updateVolume(detail.id, actualDelta, volExpId, volOp, volNote || undefined);
-      Alert.alert("已更新");
+      // updateVolume 返回钳制后的实际新体积：若扣减被截断（剩余不足），提示实际扣除
+      const newVolume = await updateVolume(detail.id, actualDelta, volExpId, volOp, volNote || undefined);
+      const expected = detail.volume_ul + actualDelta;
+      if (volOp === "use" && Math.abs(newVolume - expected) > 1e-6) {
+        Alert.alert("已更新", `仅剩余 ${newVolume} μL，已按实际扣除`);
+      } else {
+        Alert.alert("已更新");
+      }
       setVolDelta(""); setVolNote(""); setVolExpId(null);
       openDetail(detail.id);
       load();
@@ -128,18 +162,34 @@ export default function SamplesScreen() {
     if (!detail) return;
     Alert.alert("标记废弃", `确定将「${detail.name}」标记为废弃吗？`, [
       { text: "取消", style: "cancel" },
-      { text: "废弃", style: "destructive", onPress: async () => { await discardSample(detail.id); closeDetail(); load(); } },
+      {
+        text: "废弃", style: "destructive",
+        onPress: async () => {
+          try {
+            await discardSample(detail.id);
+            closeDetail(); load();
+          } catch (e: any) { Alert.alert("失败", e?.message ?? "操作失败"); }
+        },
+      },
     ]);
   };
 
   // ── Create new sample ──
   const handleCreate = async () => {
     if (!newName.trim()) { Alert.alert("提示", "请输入样品名称"); return; }
+    const vol = parseFloat(newVol);
+    // parseFloat("") 是 NaN：空输入与负数都必须拦截，不接受负体积
+    if (!Number.isFinite(vol) || vol < 0) { Alert.alert("提示", "剩余量必须为大于等于 0 的数字"); return; }
+    let locJson = "{}";
+    if (newLoc.trim()) {
+      try { JSON.parse(newLoc.trim()); locJson = newLoc.trim(); }
+      catch { Alert.alert("提示", "存储位置格式错误，需为 JSON（如 {\"device\":\"-80°C冰箱\"}）"); return; }
+    }
     try {
       await createSample({
-        name: newName.trim(), type: newType, volume_ul: parseFloat(newVol) || 0,
+        name: newName.trim(), type: newType, volume_ul: vol,
         concentration: newConc, concentration_unit: newConcUnit,
-        location_json: newLoc || "{}", storage_temp: newTemp,
+        location_json: locJson, storage_temp: newTemp,
         source_experiment_id: newExpId, notes: newNotes,
       });
       Alert.alert("已创建");
@@ -150,6 +200,32 @@ export default function SamplesScreen() {
 
   // ── Parse location ──
   const parseLoc = (json: string) => { try { return JSON.parse(json); } catch { return {}; } };
+
+  // Group by storage_temp（hook 必须在任何条件 return 之前调用）
+  const grouped = useMemo(() => {
+    const map: Record<string, SampleWithMeta[]> = { '-80': [], '-20': [], '4': [], 'RT': [] };
+    samples.forEach((s) => { if (map[s.storage_temp]) map[s.storage_temp].push(s); });
+    return Object.entries(map).filter(([, v]) => v.length > 0);
+  }, [samples]);
+
+  // ════════════════════════════════════════════════════════════
+  // Detail Loading View（详情数据到达前显示 spinner，不回落列表）
+  // ════════════════════════════════════════════════════════════
+  if (detailId !== null && detailLoading && !detail) {
+    return (
+      <SafeAreaView className="flex-1 bg-gray-50" edges={["top"]}>
+        <View className="bg-white px-5 pt-4 pb-4 border-b border-gray-100 flex-row items-center">
+          <TouchableOpacity className="w-10 h-10 rounded-full bg-gray-100 items-center justify-center mr-3" onPress={closeDetail}>
+            <Ionicons name="arrow-back" size={22} color="#374151" />
+          </TouchableOpacity>
+          <Text className="text-lg font-bold text-gray-900">样品详情</Text>
+        </View>
+        <View className="flex-1 items-center justify-center">
+          <ActivityIndicator size="large" color="#3b82f6" />
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   // ════════════════════════════════════════════════════════════
   // Detail View
@@ -251,13 +327,6 @@ export default function SamplesScreen() {
   // List View
   // ════════════════════════════════════════════════════════════
 
-  // Group by storage_temp
-  const grouped = useMemo(() => {
-    const map: Record<string, SampleWithMeta[]> = { '-80': [], '-20': [], '4': [], 'RT': [] };
-    samples.forEach((s) => { if (map[s.storage_temp]) map[s.storage_temp].push(s); });
-    return Object.entries(map).filter(([, v]) => v.length > 0);
-  }, [samples]);
-
   return (
     <SafeAreaView className="flex-1 bg-gray-50" edges={["top"]}>
       <View className="bg-white px-5 pt-4 pb-3 border-b border-gray-100">
@@ -310,9 +379,9 @@ export default function SamplesScreen() {
                       {s.concentration && <Text className="text-gray-400 text-xs">{s.concentration} {s.concentration_unit}</Text>}
                     </View>
                     {loc.device && <Text className="text-gray-400 text-xs mt-1">📍 {[loc.device, loc.drawer, loc.box, loc.position].filter(Boolean).join(" → ")}</Text>}
-                    <View className="h-1 bg-gray-100 rounded-full mt-2 overflow-hidden">
-                      <View className="h-full bg-primary-400 rounded-full" style={{ width: `${s.volume_ul > 0 ? Math.min(100, (s.volume_ul / (s.volume_ul + 500)) * 100) : 0}%` }} />
-                    </View>
+                    <Text className={`text-xs mt-2 font-semibold ${s.volume_ul > 0 ? "text-emerald-600" : "text-red-400"}`}>
+                      {s.volume_ul} μL{s.volume_ul <= 0 ? " · 已耗尽" : ""}
+                    </Text>
                   </TouchableOpacity>
                 );
               })}

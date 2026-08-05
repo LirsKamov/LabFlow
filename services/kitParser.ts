@@ -259,21 +259,140 @@ async function parseWithDeepSeek(
   const raw = await callDeepSeek(messages, apiKey);
 
   const cleaned = raw
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
-    .replace(/\s*```$/i, "")
+    .replace(/```json/gi, "")
+    .replace(/```/gi, "")
     .trim();
 
-  let parsed: ParsedKit;
+  let parsedRaw: unknown;
   try {
-    parsed = JSON.parse(cleaned);
-  } catch {
+    const jsonBlock = extractJsonBlock(cleaned);
+    parsedRaw = JSON.parse(jsonBlock);
+  } catch (err: any) {
+    const msg = err?.message ?? "";
+    if (msg.includes("未找到 JSON") || msg.includes("JSON 不完整")) {
+      throw new Error(`${msg} 原始返回：\n${raw.slice(0, 300)}`);
+    }
     throw new Error(
       `DeepSeek 返回内容无法解析为JSON。原始返回：\n${raw.slice(0, 500)}`
     );
   }
 
-  return parsed;
+  return normalizeParsedKit(parsedRaw);
+}
+
+// ─── JSON 提取与结构校验 ─────────────────────────────────────
+
+/** 逐字符括号配平提取第一个完整的 JSON 对象块，防止截断/围栏残留 */
+function extractJsonBlock(raw: string): string {
+  const start = raw.indexOf("{");
+  if (start === -1) {
+    throw new Error("DeepSeek 返回内容中未找到 JSON 数据块");
+  }
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < raw.length; i++) {
+    const ch = raw[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") {
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return raw.slice(start, i + 1);
+      }
+    }
+  }
+  throw new Error("DeepSeek 返回的 JSON 不完整（可能被截断）");
+}
+
+function toStr(v: unknown, fallback = ""): string {
+  if (v === null || v === undefined) return fallback;
+  return String(v);
+}
+
+function toNum(v: unknown, fallback = 0): number {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function toBool(v: unknown): boolean {
+  return Boolean(v);
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return typeof v === "object" && v !== null ? (v as Record<string, unknown>) : {};
+}
+
+/** 对 AI 返回的任意结构做逐字段强校验与兜底，杜绝审核页崩溃 */
+function normalizeParsedKit(raw: unknown): ParsedKit {
+  const obj = asRecord(raw);
+
+  const kitName = toStr(obj.kitName);
+  const componentsRaw = Array.isArray(obj.components) ? obj.components : [];
+  if (!kitName && componentsRaw.length === 0) {
+    throw new Error("AI 返回的数据结构异常，请重试");
+  }
+
+  const components: ParsedComponent[] = componentsRaw.map((c) => {
+    const co = asRecord(c);
+    return {
+      name: toStr(co.name),
+      unit: toStr(co.unit),
+      qty_per_kit: toStr(co.qty_per_kit),
+      storage: toStr(co.storage),
+    };
+  });
+
+  const sopSteps: ParsedSopStep[] = (Array.isArray(obj.sopSteps) ? obj.sopSteps : [])
+    .map((s) => {
+      const so = asRecord(s);
+      return {
+        step_num: toNum(so.step_num),
+        title: toStr(so.title),
+        description: toStr(so.description),
+        duration_min: toNum(so.duration_min, 0),
+        timer_required: toBool(so.timer_required),
+      };
+    })
+    .sort((a, b) => a.step_num - b.step_num);
+
+  const reactionTemplates: ParsedReactionTemplate[] = (
+    Array.isArray(obj.reactionTemplates) ? obj.reactionTemplates : []
+  ).map((rt) => {
+    const ro = asRecord(rt);
+    const comps = Array.isArray(ro.components) ? ro.components : [];
+    return {
+      name: toStr(ro.name),
+      total_vol: toNum(ro.total_vol, 0),
+      components: comps.map((c) => {
+        const co = asRecord(c);
+        return {
+          name: toStr(co.name),
+          vol_ul: toNum(co.vol_ul, 0),
+          ratio: toStr(co.ratio),
+        };
+      }),
+    };
+  });
+
+  const warnings: string[] = (Array.isArray(obj.warnings) ? obj.warnings : []).map(
+    (w) => toStr(w)
+  );
+
+  return { kitName, brand: toStr(obj.brand), components, sopSteps, reactionTemplates, warnings };
 }
 
 // ─── 主入口函数 ──────────────────────────────────────────────

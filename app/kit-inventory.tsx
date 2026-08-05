@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import {
   View, Text, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator,
-  RefreshControl, LayoutAnimation, Platform, UIManager, Animated,
+  RefreshControl, LayoutAnimation, Platform, UIManager, Animated, Modal,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -42,14 +42,21 @@ export default function KitInventoryScreen() {
   const [stats, setStats] = useState<{ depletionDate: string | null; avgDailyUse: number }>({ depletionDate: null, avgDailyUse: 0 });
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [kitError, setKitError] = useState("");
 
   // Manual adjust
   const [adjustComponentId, setAdjustComponentId] = useState<number | null>(null);
   const [adjustDelta, setAdjustDelta] = useState("");
   const [adjustReason, setAdjustReason] = useState("");
 
+  // 详情请求序号：快速切换试剂盒时丢弃过期响应，防止旧数据覆盖新数据
+  const detailSeqRef = useRef(0);
+
   const loadKits = useCallback(async () => {
-    try { setKits(await getKitSummaries()); } catch (e) { console.error(e); }
+    try {
+      setKits(await getKitSummaries());
+      setKitError("");
+    } catch (e) { console.error(e); setKitError("加载失败，下拉重试"); }
   }, []);
 
   useFocusEffect(useCallback(() => { loadKits(); }, [loadKits]));
@@ -57,16 +64,18 @@ export default function KitInventoryScreen() {
   const onRefresh = async () => { setRefreshing(true); await loadKits(); if (selectedKitId) await loadDetail(selectedKitId); setRefreshing(false); };
 
   const loadDetail = async (kitId: number) => {
+    const seq = ++detailSeqRef.current;
     setLoading(true);
     try {
       const [comps, r, hist, s] = await Promise.all([
         getKitComponents(kitId), getRemainingRuns(kitId),
         getUsageHistory(kitId), getUsageStats(kitId),
       ]);
+      if (seq !== detailSeqRef.current) return; // 已有更新的请求，丢弃过期响应
       setComponents(comps); setRuns(r); setHistory(hist);
       setStats({ depletionDate: s.depletionDate, avgDailyUse: s.avgDailyUse });
-    } catch (e) { console.error(e); }
-    finally { setLoading(false); }
+    } catch (e) { console.error(e); if (seq === detailSeqRef.current) Alert.alert("加载失败", "详情加载失败，请下拉重试"); }
+    finally { if (seq === detailSeqRef.current) setLoading(false); }
   };
 
   const openKit = (id: number) => {
@@ -81,9 +90,10 @@ export default function KitInventoryScreen() {
   };
 
   const handleAdjust = async () => {
-    if (!adjustComponentId || !adjustDelta) return;
+    if (!adjustComponentId) return;
     const delta = parseFloat(adjustDelta);
-    if (isNaN(delta)) { Alert.alert("提示", "请输入有效数量"); return; }
+    // "0" 字符串是 truthy，原 `!adjustDelta` 守卫拦不住；parseFloat 结果也须排除 0
+    if (isNaN(delta) || delta === 0) { Alert.alert("提示", "请输入非零数量（正数=补货，负数=扣减）"); return; }
     try {
       await adjustInventory(adjustComponentId, delta, adjustReason || "手动调整");
       Alert.alert("已更新", delta >= 0 ? "库存已增加" : "库存已扣减");
@@ -91,6 +101,21 @@ export default function KitInventoryScreen() {
       if (selectedKitId) await loadDetail(selectedKitId);
       await loadKits();
     } catch (e: any) { Alert.alert("失败", e?.message); }
+  };
+
+  // 用量历史前缀：按 operation 区分（use 显示 -x，restock/adjust 显示 +x/-x）
+  // 优先取 usage_logs.operation 列（另一 Worker 正在加的字段，类型为可选以兼容轮询等待期），
+  // 字段未就位时回退按 note 前缀判断（"补货:" → restock，"纠错:" → adjust）。
+  const historySign = (h: any): { sign: string; text: string } => {
+    const qty = Number.isFinite(h.used_qty) ? h.used_qty.toFixed(1) : "0.0";
+    const note = typeof h.note === "string" ? h.note : "";
+    const op = h.operation
+      ?? (note.startsWith("补货:") ? "restock" : note.startsWith("纠错:") ? "adjust" : "use");
+    if (op === "use") return { sign: "-", text: `-${qty}` };
+    if (op === "restock") return { sign: "+", text: `+${qty}` };
+    // adjust（手动纠错）：正数=补货、负数=扣减，从 note 中还原符号
+    const neg = /纠错:.*\(\s*-/.test(note);
+    return { sign: neg ? "-" : "+", text: `${neg ? "-" : "+"}${qty}` };
   };
 
   // ════════════════════════════════════════════════════════════
@@ -140,7 +165,9 @@ export default function KitInventoryScreen() {
 
               {/* Components */}
               <Text className="text-sm font-bold text-gray-700 mb-2">内容物库存</Text>
-              {components.map((c) => {
+              {components.length === 0 ? (
+                <Text className="text-gray-400 text-xs py-4 text-center">暂无组分</Text>
+              ) : components.map((c) => {
                 const hc = healthColor(c.health);
                 return (
                   <View key={c.id} className="bg-white rounded-2xl p-4 mb-2 border border-gray-100">
@@ -175,7 +202,9 @@ export default function KitInventoryScreen() {
                     <Text className="text-xs font-semibold text-gray-700">{h.component_name}</Text>
                     <Text className="text-xs text-gray-400">{h.used_at}</Text>
                   </View>
-                  <Text className="text-xs text-gray-500 mt-0.5">-{h.used_qty.toFixed(1)} {h.unit} · {h.note}</Text>
+                  <Text className={`text-xs mt-0.5 ${historySign(h).sign === "-" ? "text-red-500" : "text-emerald-600"}`}>
+                    {historySign(h).text} {h.unit} · {h.note}
+                  </Text>
                   {h.experiment_name && <Text className="text-xs text-blue-500 mt-0.5">实验: {h.experiment_name}</Text>}
                 </View>
               ))}
@@ -184,9 +213,9 @@ export default function KitInventoryScreen() {
           )}
         </ScrollView>
 
-        {/* Manual Adjust Modal */}
-        {adjustComponentId !== null && (
-          <View className="absolute inset-0 bg-black/40 justify-center items-center px-6">
+        {/* Manual Adjust Modal（RN Modal 支持 Android 返回键关闭） */}
+        <Modal visible={adjustComponentId !== null} transparent animationType="fade" onRequestClose={() => setAdjustComponentId(null)}>
+          <View className="flex-1 bg-black/40 justify-center items-center px-6">
             <View className="bg-white rounded-2xl p-5 w-full">
               <Text className="text-lg font-bold text-gray-900 mb-4">手动调整库存</Text>
               <Text className="text-sm text-gray-600 mb-2">数量（正数=补货，负数=扣减）</Text>
@@ -203,7 +232,7 @@ export default function KitInventoryScreen() {
               </View>
             </View>
           </View>
-        )}
+        </Modal>
       </SafeAreaView>
     );
   }
@@ -226,7 +255,13 @@ export default function KitInventoryScreen() {
       <ScrollView className="flex-1 px-4 pt-4" showsVerticalScrollIndicator={false}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={["#2563eb"]} />}>
 
-        {kits.length === 0 ? (
+        {kitError ? (
+          <View className="items-center py-10">
+            <Ionicons name="cloud-offline-outline" size={40} color="#f59e0b" />
+            <Text className="text-amber-600 mt-2 text-sm">{kitError}</Text>
+            <Text className="text-gray-300 text-xs mt-1">下拉页面重试</Text>
+          </View>
+        ) : kits.length === 0 ? (
           <View className="items-center py-16">
             <Ionicons name="cube-outline" size={48} color="#d1d5db" />
             <Text className="text-gray-400 mt-3 text-lg">暂无试剂盒</Text>

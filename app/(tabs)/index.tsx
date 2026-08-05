@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useRef } from "react";
 import {
   View,
   Text,
@@ -13,8 +13,9 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import * as SQLite from "expo-sqlite";
 import { useFocusEffect, router } from "expo-router";
+import { getDb } from "../../db/database";
+import { todayLocal } from "../../utils/date";
 import type { Todo, Experiment } from "../../db/schema";
 import { useDailyPlan } from "../../hooks/useDailyPlan";
 import { useLLMSettings } from "../../hooks/useLLMSettings";
@@ -78,49 +79,81 @@ function TimelineCard({ item, isLast }: { item: DailyPlan["timeline"][0]; isLast
 export default function TodayScreen() {
   const [todos, setTodos] = useState<Todo[]>([]);
   const [experiments, setExperiments] = useState<Experiment[]>([]);
-  const [summary, setSummary] = useState({ todoCount: 0, todoDone: 0, experimentCount: 0, highPriorityCount: 0 });
+  const [summary, setSummary] = useState({ todoCount: 0, experimentCount: 0, highPriorityCount: 0 });
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
 
   const { plan, loading: planLoading, generating, error: planError, loadTodayPlan, generate, clearPlan } = useDailyPlan();
   const { configured } = useLLMSettings();
 
+  const loadSeqRef = useRef(0);
+
   const loadData = useCallback(async () => {
+    const seq = ++loadSeqRef.current;
+    setLoading(true);
     setLoadError(null);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const today = new Date().toISOString().split("T")[0];
+      const db = await getDb();
+      const today = todayLocal();
       const todoRows = await db.getAllAsync<Todo>(
         `SELECT * FROM todos WHERE done = 0 ORDER BY CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 END, due_date ASC LIMIT 20`
       );
-      setTodos(todoRows);
       const expRows = await db.getAllAsync<Experiment>(
         "SELECT * FROM experiments WHERE scheduled_date = ? AND status != 'cancelled' ORDER BY scheduled_time ASC", [today]
       );
+      const countRow = await db.getFirstAsync<{ c: number }>(
+        "SELECT COUNT(*) AS c FROM todos WHERE done = 0"
+      );
+      const highRow = await db.getFirstAsync<{ c: number }>(
+        "SELECT COUNT(*) AS c FROM todos WHERE done = 0 AND priority IN ('high', 'urgent')"
+      );
+      if (seq !== loadSeqRef.current) return;
+      setTodos(todoRows);
       setExperiments(expRows);
-      const allTodos = await db.getAllAsync<Todo>("SELECT * FROM todos WHERE done = 0");
-      const highP = allTodos.filter((t) => t.priority === "high" || t.priority === "urgent");
-      setSummary({ todoCount: allTodos.length, todoDone: 0, experimentCount: expRows.length, highPriorityCount: highP.length });
+      setSummary({ todoCount: countRow?.c ?? 0, experimentCount: expRows.length, highPriorityCount: highRow?.c ?? 0 });
     } catch (err: any) {
+      if (seq !== loadSeqRef.current) return;
       console.error("[index] load error:", err);
       setLoadError(err?.message ?? "数据加载失败，下拉刷新重试");
+    } finally {
+      if (seq === loadSeqRef.current) setLoading(false);
     }
   }, []);
 
-  useFocusEffect(useCallback(() => { loadData(); loadTodayPlan(); }, [loadData, loadTodayPlan]));
+  useFocusEffect(useCallback(() => {
+    loadSeqRef.current++;
+    loadData();
+    loadTodayPlan();
+    return () => { loadSeqRef.current++; };
+  }, [loadData, loadTodayPlan]));
 
   const onRefresh = async () => { setRefreshing(true); await loadData(); await loadTodayPlan(); setRefreshing(false); };
 
-  const toggleTodo = async (id: number, cd: 0 | 1) => {
+  const toggleTodo = async (todo: Todo) => {
+    const nd = todo.done === 1 ? 0 : 1;
+    const prevTodos = todos;
+    const prevSummary = summary;
+    if (nd === 1) {
+      setTodos((prev) => prev.filter((t) => t.id !== todo.id));
+      setSummary((prev) => ({
+        ...prev,
+        todoCount: Math.max(0, prev.todoCount - 1),
+        highPriorityCount: Math.max(0, prev.highPriorityCount - (todo.priority === "high" || todo.priority === "urgent" ? 1 : 0)),
+      }));
+    }
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const nd = cd === 1 ? 0 : 1;
-      await db.runAsync("UPDATE todos SET done=?, completed_at=? WHERE id=?", [nd, nd === 1 ? new Date().toISOString() : null, id]);
-      await loadData();
-    } catch (err: any) { Alert.alert("操作失败", err?.message ?? "请稍后重试"); }
+      const db = await getDb();
+      await db.runAsync("UPDATE todos SET done=?, completed_at=? WHERE id=?", [nd, nd === 1 ? new Date().toISOString() : null, todo.id]);
+    } catch (err: any) {
+      setTodos(prevTodos);
+      setSummary(prevSummary);
+      Alert.alert("操作失败", err?.message ?? "请稍后重试");
+    }
   };
 
   const handleGenerate = async () => {
+    if (generating) return;
     if (!configured) { router.push("/settings"); return; }
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     try {
@@ -263,7 +296,16 @@ export default function TodayScreen() {
         )}
 
         <Text className="text-lg font-bold text-gray-800 mb-3">今日实验安排</Text>
-        {experiments.length === 0 ? (
+        {loading && todos.length === 0 && experiments.length === 0 ? (
+          <View>
+            {[1, 2].map((i) => (
+              <View key={i} className="bg-white rounded-2xl p-5 h-24 mb-3 opacity-50">
+                <View className="w-2/3 h-5 bg-gray-100 rounded mb-3" />
+                <View className="w-1/3 h-4 bg-gray-50 rounded" />
+              </View>
+            ))}
+          </View>
+        ) : experiments.length === 0 ? (
           <View className="card items-center py-6 mb-4"><Ionicons name="flask-outline" size={40} color="#d1d5db" /><Text className="text-gray-400 mt-2">今日暂无实验安排</Text></View>
         ) : experiments.map((exp) => (
           <TouchableOpacity key={exp.id} className="card mb-3 flex-row items-center" activeOpacity={0.7} onPress={() => router.push("/(tabs)/experiment")}>
@@ -276,12 +318,16 @@ export default function TodayScreen() {
         ))}
 
         <Text className="text-lg font-bold text-gray-800 mt-6 mb-3">待办事项</Text>
-        {todos.length === 0 ? (
+        {loading && todos.length === 0 && experiments.length === 0 ? (
+          <View className="card items-center py-6 mb-8">
+            <ActivityIndicator size="large" color="#3b82f6" />
+          </View>
+        ) : todos.length === 0 ? (
           <View className="card items-center py-6 mb-8"><Ionicons name="checkmark-circle-outline" size={40} color="#d1d5db" /><Text className="text-gray-400 mt-2">暂无待办事项</Text></View>
         ) : todos.map((todo) => {
           const pc = pCfg(todo.priority);
           return (
-            <TouchableOpacity key={todo.id} className="card mb-2 flex-row items-center" activeOpacity={0.7} onPress={() => toggleTodo(todo.id, todo.done)}>
+            <TouchableOpacity key={todo.id} className="card mb-2 flex-row items-center" activeOpacity={0.7} onPress={() => toggleTodo(todo)}>
               <View className={`w-6 h-6 rounded-full border-2 mr-3 items-center justify-center ${todo.done === 1 ? "bg-primary-600 border-primary-600" : "border-gray-300"}`}>
                 {todo.done === 1 && <Ionicons name="checkmark" size={14} color="white" />}
               </View>

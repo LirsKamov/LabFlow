@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../db/database";
+import { formatDateTimeCN } from "../utils/date";
 import type { Todo } from "../db/schema";
 
 // ─── Hook ────────────────────────────────────────────────────
@@ -12,11 +13,12 @@ export function useTodos(projectId: number | null) {
   const loadTodos = useCallback(async () => {
     if (projectId === null) {
       setTodos([]);
+      setLoading(false);
       return;
     }
     setLoading(true);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const rows = await db.getAllAsync<Todo>(
         `SELECT * FROM todos
          WHERE project_id = ?
@@ -33,7 +35,6 @@ export function useTodos(projectId: number | null) {
       setTodos(rows);
     } catch (error) {
       console.error("[useTodos] 加载失败:", error);
-      throw error;
     } finally {
       setLoading(false);
     }
@@ -47,13 +48,20 @@ export function useTodos(projectId: number | null) {
       dueDate: string | null = null
     ): Promise<number> => {
       if (projectId === null) throw new Error("未指定项目");
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const result = await db.runAsync(
-        "INSERT INTO todos (project_id, title, priority, due_date, done) VALUES (?, ?, ?, ?, 0)",
-        [projectId, title.trim(), priority, dueDate]
-      );
-      await loadTodos();
-      return result.lastInsertRowId;
+      const trimmed = title.trim();
+      if (!trimmed) throw new Error("请输入待办内容");
+      try {
+        const db = await getDb();
+        const result = await db.runAsync(
+          "INSERT INTO todos (project_id, title, priority, due_date, done) VALUES (?, ?, ?, ?, 0)",
+          [projectId, trimmed, priority, dueDate]
+        );
+        await loadTodos();
+        return result.lastInsertRowId;
+      } catch (error) {
+        console.error("[useTodos] 添加待办失败:", error);
+        throw error;
+      }
     },
     [projectId, loadTodos]
   );
@@ -61,13 +69,18 @@ export function useTodos(projectId: number | null) {
   /** 切换完成状态 */
   const toggleTodo = useCallback(
     async (id: number, currentDone: 0 | 1): Promise<void> => {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
       const newDone = currentDone === 1 ? 0 : 1;
-      await db.runAsync(
-        "UPDATE todos SET done = ?, completed_at = ? WHERE id = ?",
-        [newDone, newDone === 1 ? new Date().toISOString() : null, id]
-      );
-      await loadTodos();
+      try {
+        const db = await getDb();
+        await db.runAsync(
+          "UPDATE todos SET done = ?, completed_at = ? WHERE id = ?",
+          [newDone, newDone === 1 ? formatDateTimeCN(new Date()) : null, id]
+        );
+        await loadTodos();
+      } catch (error) {
+        console.error("[useTodos] 切换待办状态失败:", error);
+        throw error;
+      }
     },
     [loadTodos]
   );
@@ -75,9 +88,14 @@ export function useTodos(projectId: number | null) {
   /** 删除待办 */
   const deleteTodo = useCallback(
     async (id: number): Promise<void> => {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      await db.runAsync("DELETE FROM todos WHERE id = ?", [id]);
-      await loadTodos();
+      try {
+        const db = await getDb();
+        await db.runAsync("DELETE FROM todos WHERE id = ?", [id]);
+        await loadTodos();
+      } catch (error) {
+        console.error("[useTodos] 删除待办失败:", error);
+        throw error;
+      }
     },
     [loadTodos]
   );

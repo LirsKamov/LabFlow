@@ -1,3 +1,9 @@
+/*
+ * primary 色板唯一来源声明：
+ * :root 中的 --color-primary-500/600/800 是 primary 色板的唯一权威来源，
+ * tailwind.config.js 中同名色值必须与下方保持完全一致。
+ * 修改颜色时请同步更新两处（新增色阶时两处都要添加）。
+ */
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

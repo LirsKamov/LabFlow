@@ -1,13 +1,30 @@
 {
   "cli": {
-    "version": ">= 7.0.0"
+    "version": ">= 5.9.0",
+    "appVersionSource": "remote"
   },
   "build": {
-    "preview": {
+    // development：本地调试（Expo Go / development build），构建 APK
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal",
+      "channel": "development",
       "android": {
         "buildType": "apk"
-      },
-      "distribution": "internal"
+      }
+    },
+    // preview：内部分发测试，构建 APK
+    "preview": {
+      "distribution": "internal",
+      "channel": "preview",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    // production：正式发布；autoIncrement 解决 versionCode 静态不递增问题
+    "production": {
+      "channel": "production",
+      "autoIncrement": true
     }
   },
   "submit": {

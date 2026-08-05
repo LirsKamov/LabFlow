@@ -5,11 +5,14 @@
  *  - Anthropic (Claude Sonnet 4)
  *  - DeepSeek (OpenAI 兼容协议)
  *
- * API Key 通过 AsyncStorage 持久化，用户在设置页输入。
+ * API Key 通过 SecureStore（iOS Keychain / Android Keystore）加密持久化，
+ * 用户在设置页输入。旧版本存于 AsyncStorage 的值会在首次读取时自动迁移。
  */
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import type { Experiment, Todo } from "../db/schema";
+import { getSecret, setSecret } from "../utils/secureStore";
+import { todayLocal } from "../utils/date";
 
 // ─── API 端点 ────────────────────────────────────────────────
 
@@ -52,26 +55,61 @@ export interface DailyPlan {
 
 /** 保存 LLM 设置（供 useLLMSettings Hook 使用） */
 export async function saveLLMSettings(settings: LLMSettings): Promise<void> {
-  await AsyncStorage.multiSet([
-    ["api_key_deepseek", settings.apiKey],
-    ["llm_provider", settings.provider],
-    ["llm_model", settings.model],
+  await Promise.all([
+    setSecret("api_key_deepseek", settings.apiKey),
+    setSecret("llm_provider", settings.provider),
+    setSecret("llm_model", settings.model),
   ]);
+  // 清理旧版 AsyncStorage 明文值（一次性迁移）
+  try {
+    await AsyncStorage.multiRemove(["api_key_deepseek", "llm_provider", "llm_model"]);
+  } catch {
+    /* 旧值清理失败可忽略，读取时会走回退逻辑 */
+  }
+}
+
+/**
+ * 读取密钥：优先 SecureStore，未命中时回退 AsyncStorage 旧值，
+ * 读到旧值后写入 SecureStore 并删除 AsyncStorage 键（平滑迁移）。
+ */
+async function readSecretWithMigration(key: string): Promise<string | null> {
+  try {
+    const secured = await getSecret(key);
+    if (secured !== null) return secured;
+  } catch {
+    /* SecureStore 不可用时回退 AsyncStorage */
+  }
+  try {
+    const legacy = await AsyncStorage.getItem(key);
+    if (legacy !== null) {
+      try {
+        await setSecret(key, legacy);
+        await AsyncStorage.removeItem(key);
+      } catch {
+        /* 迁移失败不影响本次读取 */
+      }
+    }
+    return legacy;
+  } catch {
+    return null;
+  }
 }
 
 /** 读取 LLM 设置 */
 export async function getLLMSettings(): Promise<LLMSettings | null> {
-  const pairs = await AsyncStorage.multiGet(["api_key_deepseek", "llm_provider", "llm_model"]);
-  const apiKey = pairs[0][1];
-  const provider = (pairs[1][1] as LLMProvider) || "deepseek";
-  const model = pairs[2][1];
+  const [apiKey, providerRaw, model] = await Promise.all([
+    readSecretWithMigration("api_key_deepseek"),
+    readSecretWithMigration("llm_provider"),
+    readSecretWithMigration("llm_model"),
+  ]);
+  const provider = (providerRaw as LLMProvider) || "deepseek";
   if (!apiKey) return null;
   return { provider, apiKey, model: model || (provider === "anthropic" ? "claude-sonnet-4-20250514" : "deepseek-chat") };
 }
 
 /** 仅获取 API Key */
 export async function getAPIKey(): Promise<string> {
-  return (await AsyncStorage.getItem("api_key_deepseek")) ?? "";
+  return (await readSecretWithMigration("api_key_deepseek")) ?? "";
 }
 
 /** 检查是否已配置 */
@@ -119,6 +157,22 @@ async function callLLM(
 
 // ─── Anthropic API ───────────────────────────────────────────
 
+/** 带 60 秒超时的 fetch，超时抛出 "请求超时，请重试" */
+async function fetchWithTimeout(url: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (error: any) {
+    if (controller.signal.aborted) {
+      throw new Error("请求超时，请重试");
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function callAnthropic(
   apiKey: string,
   model: string,
@@ -144,7 +198,7 @@ async function callAnthropic(
 
   // Anthropic 不支持 response_format，通过 prompt 约束 JSON
 
-  const response = await fetch(API_ENDPOINTS.anthropic, {
+  const response = await fetchWithTimeout(API_ENDPOINTS.anthropic, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -188,7 +242,7 @@ async function callDeepSeek(
     body.response_format = { type: "json_object" };
   }
 
-  const response = await fetch(API_ENDPOINTS.deepseek, {
+  const response = await fetchWithTimeout(API_ENDPOINTS.deepseek, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -323,7 +377,7 @@ export async function generateDailyPlan(
   experiments: Experiment[],
   todos: Todo[]
 ): Promise<{ plan: DailyPlan | null; error?: string }> {
-  const today = new Date().toISOString().split("T")[0];
+  const today = todayLocal();
   const { system, user } = buildDailyPlanPrompt(experiments, todos, today);
 
   const response = await callLLM(

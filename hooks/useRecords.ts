@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../db/database";
+import { formatDateLabel } from "../utils/date";
 import type { Record as DBRecord } from "../db/schema";
 
 // ─── 扩展类型 ────────────────────────────────────────────────
@@ -14,7 +15,7 @@ export interface RecordWithMeta extends DBRecord {
 /** 按日期分组 */
 export interface DateGroup {
   date: string; // "2026-05-31"
-  dateLabel: string; // "5月31日 周二"
+  dateLabel: string; // "5月31日" / "今天" / "昨天"
   records: RecordWithMeta[];
 }
 
@@ -32,6 +33,25 @@ export interface ExperimentOption {
   project_name: string | null;
 }
 
+// ─── 公共 SQL 片段 ──────────────────────────────────────────
+
+/** 记录列表公共 SELECT（带关联名称），供 loadRecords / searchRecords 复用 */
+const RECORD_SELECT_SQL = `
+  SELECT
+    r.*,
+    e.name AS experiment_name,
+    p.name AS project_name,
+    p.id   AS project_id
+  FROM records r
+  LEFT JOIN experiments e ON r.experiment_id = e.id
+  LEFT JOIN projects    p ON e.project_id    = p.id
+`;
+
+/** 转义 LIKE 通配符（配合 ESCAPE '\' 使用） */
+function escapeLike(keyword: string): string {
+  return keyword.replace(/[\\%_]/g, (m) => `\\${m}`);
+}
+
 // ─── Hook ────────────────────────────────────────────────────
 
 export function useRecords() {
@@ -39,35 +59,47 @@ export function useRecords() {
   const [experimentOptions, setExperimentOptions] = useState<ExperimentOption[]>([]);
   const [loading, setLoading] = useState(false);
 
-  // ── 加载所有记录（带关联名称） ──
-  const loadRecords = useCallback(async () => {
-    setLoading(true);
+  // ── 加载记录（带关联名称，支持分页；不传参时与旧行为等价） ──
+  const loadRecords = useCallback(
+    async (params?: { offset?: number; limit?: number }): Promise<void> => {
+      const { offset = 0, limit = 100 } = params ?? {};
+      setLoading(true);
+      try {
+        const db = await getDb();
+        const rows = await db.getAllAsync<RecordWithMeta>(
+          `${RECORD_SELECT_SQL}
+           ORDER BY r.created_at DESC
+           LIMIT ? OFFSET ?`,
+          [limit, offset]
+        );
+        setRecords(rows);
+      } catch (err) {
+        console.error("[useRecords] 加载失败:", err);
+      } finally {
+        setLoading(false);
+      }
+    },
+    []
+  );
+
+  /** 获取记录总数（供分页/加载更多使用） */
+  const getRecordCount = useCallback(async (): Promise<number> => {
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const rows = await db.getAllAsync<RecordWithMeta>(
-        `SELECT
-          r.*,
-          e.name AS experiment_name,
-          p.name AS project_name,
-          p.id   AS project_id
-        FROM records r
-        LEFT JOIN experiments e ON r.experiment_id = e.id
-        LEFT JOIN projects    p ON e.project_id    = p.id
-        ORDER BY r.created_at DESC
-        LIMIT 100`
+      const db = await getDb();
+      const row = await db.getFirstAsync<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM records"
       );
-      setRecords(rows);
+      return row?.count ?? 0;
     } catch (err) {
-      console.error("[useRecords] 加载失败:", err);
-    } finally {
-      setLoading(false);
+      console.error("[useRecords] 获取记录总数失败:", err);
+      return 0;
     }
   }, []);
 
   // ── 加载实验选项列表 ──
   const loadExperimentOptions = useCallback(async () => {
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const rows = await db.getAllAsync<ExperimentOption>(
         `SELECT
           e.id,
@@ -84,7 +116,7 @@ export function useRecords() {
     }
   }, []);
 
-  // ── 关键词搜索 ──
+  // ── 关键词搜索（LIKE 通配符已转义） ──
   const searchRecords = useCallback(async (keyword: string) => {
     if (!keyword.trim()) {
       await loadRecords();
@@ -92,23 +124,16 @@ export function useRecords() {
     }
     setLoading(true);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const like = `%${keyword.trim()}%`;
+      const db = await getDb();
+      const like = `%${escapeLike(keyword.trim())}%`;
       const rows = await db.getAllAsync<RecordWithMeta>(
-        `SELECT
-          r.*,
-          e.name AS experiment_name,
-          p.name AS project_name,
-          p.id   AS project_id
-        FROM records r
-        LEFT JOIN experiments e ON r.experiment_id = e.id
-        LEFT JOIN projects    p ON e.project_id    = p.id
-        WHERE r.title   LIKE ?
-           OR r.content LIKE ?
-           OR e.name    LIKE ?
-           OR p.name    LIKE ?
-        ORDER BY r.created_at DESC
-        LIMIT 100`,
+        `${RECORD_SELECT_SQL}
+         WHERE r.title   LIKE ? ESCAPE '\\'
+            OR r.content LIKE ? ESCAPE '\\'
+            OR e.name    LIKE ? ESCAPE '\\'
+            OR p.name    LIKE ? ESCAPE '\\'
+         ORDER BY r.created_at DESC
+         LIMIT 100`,
         [like, like, like, like]
       );
       setRecords(rows);
@@ -127,7 +152,7 @@ export function useRecords() {
       content: string,
       imagesJson: string = "[]"
     ): Promise<number> => {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const result = await db.runAsync(
         `INSERT INTO records (experiment_id, title, content, images_json)
          VALUES (?, ?, ?, ?)`,
@@ -142,7 +167,7 @@ export function useRecords() {
   // ── 删除记录 ──
   const deleteRecord = useCallback(
     async (id: number): Promise<void> => {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       await db.runAsync("DELETE FROM records WHERE id = ?", [id]);
       await loadRecords();
     },
@@ -188,6 +213,7 @@ export function useRecords() {
     experimentOptions,
     loading,
     loadRecords,
+    getRecordCount,
     loadExperimentOptions,
     searchRecords,
     createRecord,
@@ -195,29 +221,4 @@ export function useRecords() {
     getDateGroups,
     getProjectGroups,
   };
-}
-
-// ─── 工具函数 ────────────────────────────────────────────────
-
-/** 格式化日期为中文标签 */
-function formatDateLabel(dateStr: string): string {
-  try {
-    const d = new Date(dateStr);
-    const weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
-    const month = d.getMonth() + 1;
-    const day = d.getDate();
-    const wd = weekdays[d.getDay()];
-
-    const today = new Date();
-    const todayStr = today.toISOString().split("T")[0];
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    const yesterdayStr = yesterday.toISOString().split("T")[0];
-
-    if (dateStr === todayStr) return "今天";
-    if (dateStr === yesterdayStr) return "昨天";
-    return `${month}月${day}日 ${wd}`;
-  } catch {
-    return dateStr;
-  }
 }

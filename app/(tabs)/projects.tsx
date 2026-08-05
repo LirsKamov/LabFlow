@@ -17,7 +17,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect, router } from "expo-router";
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../../db/database";
+import { toLocalDateString } from "../../utils/date";
 import { useProjects, type ProjectWithStats } from "../../hooks/useProjects";
 import { useTodos } from "../../hooks/useTodos";
 import { getKitSummaries } from "../../services/inventoryService";
@@ -166,18 +167,51 @@ export default function ProjectsScreen() {
   // ── 下拉刷新 ──
   const [refreshing, setRefreshing] = useState(false);
 
+  // ── 加载试剂盒列表（供新建实验用） ──
+  const loadKits = useCallback(async () => {
+    try {
+      const db = await getDb();
+      const rows = await db.getAllAsync<{ id: number; name: string }>(
+        "SELECT id, name FROM kits ORDER BY name"
+      );
+      setKits(rows);
+    } catch { /* 表可能尚不存在 */ }
+  }, []);
+
+  // ── 加载试剂盒库存汇总 ──
+  const loadKitSummary = useCallback(async () => {
+    try {
+      const allKits = await getKitSummaries();
+      setKitSummary({
+        count: allKits.length,
+        lowStock: allKits.filter((k) => k.overallHealth < 0.3).length,
+        loading: false,
+      });
+    } catch {
+      setKitSummary({ count: 0, lowStock: 0, loading: false });
+    }
+  }, []);
+
   // ── 页面聚焦 ──
   useFocusEffect(
     useCallback(() => {
       loadProjects();
       loadKitSummary();
-    }, [loadProjects])
+    }, [loadProjects, loadKitSummary])
   );
+
+  // ── 已加载待办所属项目（防止切换项目时闪现旧项目待办） ──
+  const [todosProjectId, setTodosProjectId] = useState<number | null>(null);
 
   // ── 展开/折叠时加载 Todo ──
   useEffect(() => {
     if (expandedId !== null) {
-      loadTodos();
+      setTodosProjectId(null);
+      loadTodos()
+        .then(() => setTodosProjectId(expandedId))
+        .catch(() => setTodosProjectId(expandedId));
+    } else {
+      setTodosProjectId(null);
     }
   }, [expandedId, loadTodos]);
 
@@ -235,31 +269,6 @@ export default function ProjectsScreen() {
     }
   };
 
-  // ── 加载试剂盒列表（供新建实验用） ──
-  const loadKits = async () => {
-    try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const rows = await db.getAllAsync<{ id: number; name: string }>(
-        "SELECT id, name FROM kits ORDER BY name"
-      );
-      setKits(rows);
-    } catch { /* 表可能尚不存在 */ }
-  };
-
-  // ── 加载试剂盒库存汇总 ──
-  const loadKitSummary = async () => {
-    try {
-      const allKits = await getKitSummaries();
-      setKitSummary({
-        count: allKits.length,
-        lowStock: allKits.filter((k) => k.overallHealth < 0.3).length,
-        loading: false,
-      });
-    } catch {
-      setKitSummary({ count: 0, lowStock: 0, loading: false });
-    }
-  };
-
   // ── 打开新建实验 Modal ──
   const openExpModal = (projId: number) => {
     setExpTargetProjId(projId);
@@ -276,11 +285,11 @@ export default function ProjectsScreen() {
     const name = expName.trim();
     if (!name) { Alert.alert("提示", "请输入实验名称"); return; }
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       await db.runAsync(
         `INSERT INTO experiments (project_id, kit_id, name, description, scheduled_date, status)
          VALUES (?, ?, ?, ?, ?, 'planned')`,
-        [expTargetProjId, expKitId, name, expDesc.trim(), expDate.toISOString().split("T")[0]]
+        [expTargetProjId, expKitId, name, expDesc.trim(), toLocalDateString(expDate)]
       );
       setExpModalVisible(false);
       await loadProjects();
@@ -289,11 +298,11 @@ export default function ProjectsScreen() {
     }
   };
 
-  // ── 删除项目 ──
+  // ── 删除项目（级联：其下待办一并删除，实验解除关联） ──
   const handleDeleteProject = (proj: ProjectWithStats) => {
     Alert.alert(
       "确认删除",
-      `确定要删除项目「${proj.name}」吗？\n关联的 ${proj.todo_count} 个待办和 ${proj.experiment_count} 个实验将解除关联。`,
+      `确定要删除项目「${proj.name}」吗？\n关联的 ${proj.todo_count} 个待办将一并删除，${proj.experiment_count} 个实验将解除关联。`,
       [
         { text: "取消", style: "cancel" },
         {
@@ -313,7 +322,7 @@ export default function ProjectsScreen() {
   const handleAddTodo = async () => {
     if (!todoTitle.trim()) { Alert.alert("提示", "请输入待办内容"); return; }
     try {
-      await addTodo(todoTitle.trim(), todoPriority, todoDueDate?.toISOString().split("T")[0] ?? null);
+      await addTodo(todoTitle.trim(), todoPriority, todoDueDate ? toLocalDateString(todoDueDate) : null);
       setTodoTitle("");
       setTodoPriority("medium");
       setTodoDueDate(null);
@@ -343,9 +352,9 @@ export default function ProjectsScreen() {
     ]);
   };
 
-  // ── 格式化日期 ──
+  // ── 格式化日期（"YYYY-MM-DD" 本地语义直接切片，避免 UTC 解析退一天） ──
   const fmtDate = (dt: string) => {
-    try { const d = new Date(dt); return `${d.getMonth() + 1}/${d.getDate()}`; }
+    try { return `${Number(dt.slice(5, 7))}/${Number(dt.slice(8, 10))}`; }
     catch { return dt; }
   };
 
@@ -510,12 +519,16 @@ export default function ProjectsScreen() {
                     </TouchableOpacity>
                     <TouchableOpacity
                       className="flex-row items-center bg-gray-50 px-3 py-1.5 rounded-lg"
-                      onPress={() => {
+                      onPress={async () => {
                         const next: Record<string, ProjectWithStats["status"]> = {
                           active: "paused", paused: "active",
                           completed: "active", archived: "active",
                         };
-                        updateStatus(proj.id, next[proj.status]);
+                        try {
+                          await updateStatus(proj.id, next[proj.status]);
+                        } catch (err: any) {
+                          Alert.alert("错误", err.message ?? "状态切换失败");
+                        }
                       }}
                     >
                       <Ionicons
@@ -550,7 +563,11 @@ export default function ProjectsScreen() {
                   </Text>
 
                   {/* 待办列表 */}
-                  {todos.length === 0 ? (
+                  {todosProjectId !== expandedId ? (
+                    <Text className="text-gray-300 text-xs py-3 text-center">
+                      加载中...
+                    </Text>
+                  ) : todos.length === 0 ? (
                     <Text className="text-gray-300 text-xs py-3 text-center">
                       暂无待办，在下方添加
                     </Text>
@@ -642,7 +659,8 @@ export default function ProjectsScreen() {
                       </View>
                       <View className="flex-1 mr-2">
                         <DatePickerField
-                          date={todoDueDate ?? new Date()}
+                          date={todoDueDate ?? undefined}
+                          placeholder="设置截止日"
                           onDateChange={(s) => setTodoDueDate(new Date(s))}
                         />
                       </View>
@@ -767,6 +785,7 @@ export default function ProjectsScreen() {
             <DatePickerField date={expDate} onDateChange={(s) => setExpDate(new Date(s))} label="计划日期" />
 
             <Text className="text-sm font-semibold text-gray-600 mb-1.5">关联试剂盒（可选）</Text>
+            {/* TODO(组A): 与 experiment.tsx 对齐 — 选中 kit 后加载其 reaction_templates 并写入 INSERT（reaction_template_id 列已存在） */}
             {kits.length === 0 ? (
               <Text className="text-gray-400 text-xs mb-4">暂无试剂盒</Text>
             ) : (

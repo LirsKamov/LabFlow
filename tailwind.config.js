@@ -4,6 +4,7 @@ module.exports = {
     "./app/**/*.{js,jsx,ts,tsx}",
     "./components/**/*.{js,jsx,ts,tsx}",
     "./hooks/**/*.{js,jsx,ts,tsx}",
+    "./services/**/*.{js,jsx,ts,tsx}",
   ],
   presets: [require("nativewind/preset")],
   theme: {
@@ -32,7 +33,9 @@ module.exports = {
         },
       },
       fontFamily: {
-        sans: ["System"],
+        // Android 上仅 ["System"] 不合法，需显式回退 sans-serif
+        sans: ["System", "sans-serif"],
+        // 注：SpaceMono 字体从未被 expo-font 加载，此配置无实际效果，仅保留作占位
         mono: ["SpaceMono", "monospace"],
       },
     },

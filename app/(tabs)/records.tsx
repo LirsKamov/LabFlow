@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import {
   View,
   Text,
@@ -30,6 +30,8 @@ import { router } from "expo-router";
 import ImageAnnotator from "../../components/ImageAnnotator";
 import { saveImage as saveRecordImage, getImagesForRecord, type RecordImage as RIImage } from "../../services/annotationService";
 import { generateExperimentReport, shareFile } from "../../services/exportService";
+import { deleteFileIfExists } from "../../utils/file";
+import { formatDateLabel } from "../../utils/date";
 
 if (
   Platform.OS === "android" &&
@@ -42,6 +44,39 @@ if (
 
 const MAX_IMAGES = 6;
 const IMAGE_SIZE = 72;
+
+// ─── 分组工具（hooks 的 getDateGroups/getProjectGroups 仅作用于 hook 内部
+//      单页 records；分页追加后需对完整列表分组，行为与 hooks 等价） ──
+
+function groupByDate(list: RecordWithMeta[]): DateGroup[] {
+  const groups: Record<string, RecordWithMeta[]> = {};
+  for (const rec of list) {
+    const key = rec.created_at?.split(" ")[0] ?? "未知日期";
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(rec);
+  }
+  return Object.entries(groups).map(([date, recs]) => ({
+    date,
+    dateLabel: formatDateLabel(date),
+    records: recs,
+  }));
+}
+
+function groupByProject(list: RecordWithMeta[]): ProjectGroup[] {
+  const groups: Record<string, RecordWithMeta[]> = {};
+  for (const rec of list) {
+    const key = rec.project_name ?? "__unassigned__";
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(rec);
+  }
+  return Object.entries(groups)
+    .filter(([, recs]) => recs.length > 0)
+    .map(([name, recs]) => ({
+      project_id: recs[0]?.project_id ?? null,
+      project_name: name === "__unassigned__" ? "独立记录" : name,
+      records: recs,
+    }));
+}
 
 // ─── 子组件 ──────────────────────────────────────────────────
 
@@ -101,8 +136,7 @@ export default function RecordsScreen() {
     searchRecords,
     createRecord,
     deleteRecord,
-    getDateGroups,
-    getProjectGroups,
+    getRecordCount,
   } = useRecords();
 
   // ── 视图模式 ──
@@ -147,38 +181,107 @@ export default function RecordsScreen() {
   // ── 下拉刷新 ──
   const [refreshing, setRefreshing] = useState(false);
 
+  // ── 分页 ──
+  const [offset, setOffset] = useState(0);
+  const [totalCount, setTotalCount] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // hooks 的 loadRecords 是"替换单页"语义，组件层按 id 去重合并出完整列表
+  const [allRecords, setAllRecords] = useState<RecordWithMeta[]>([]);
+  const lastPageRef = useRef(0);
+
+  // ── 删除中记录 id ──
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  // ── 搜索防抖 + 过期响应保护 ──
+  const searchSeqRef = useRef(0);
+
+  // 同步 hooks 单页 records 到完整列表：首页/搜索直接替换，分页按 id 合并
+  useEffect(() => {
+    if (lastPageRef.current === 0) {
+      setAllRecords(records);
+      return;
+    }
+    setAllRecords((prev) => {
+      const map = new Map(prev.map((r) => [r.id, r]));
+      for (const r of records) map.set(r.id, r);
+      return Array.from(map.values());
+    });
+  }, [records]);
+
+  const refreshFirstPage = useCallback(async () => {
+    lastPageRef.current = 0;
+    await loadRecords({ offset: 0, limit: 100 });
+    setOffset(100);
+    try {
+      const c = await getRecordCount();
+      setTotalCount(c);
+    } catch { /* 计数失败不影响列表 */ }
+  }, [loadRecords, getRecordCount]);
+
   // ── 页面聚焦 ──
   useFocusEffect(
     useCallback(() => {
-      loadRecords();
+      refreshFirstPage();
       loadExperimentOptions();
-    }, [loadRecords, loadExperimentOptions])
+    }, [refreshFirstPage, loadExperimentOptions])
   );
 
   // ── 搜索防抖 ──
   useEffect(() => {
+    const seq = ++searchSeqRef.current;
     const timer = setTimeout(() => {
-      if (searchText.trim()) {
-        searchRecords(searchText);
-        setIsSearching(true);
-      } else if (isSearching) {
-        loadRecords();
-        setIsSearching(false);
-      }
+      (async () => {
+        try {
+          lastPageRef.current = 0;
+          if (searchText.trim()) {
+            await searchRecords(searchText);
+            if (seq !== searchSeqRef.current) return;
+            setIsSearching(true);
+          } else {
+            await loadRecords({ offset: 0, limit: 100 });
+            if (seq !== searchSeqRef.current) return;
+            setOffset(100);
+            setIsSearching(false);
+            try {
+              const c = await getRecordCount();
+              if (seq !== searchSeqRef.current) return;
+              setTotalCount(c);
+            } catch { /* 计数失败不影响列表 */ }
+          }
+        } catch { /* 搜索失败保持现状 */ }
+      })();
     }, 300);
     return () => clearTimeout(timer);
-  }, [searchText, searchRecords, loadRecords, isSearching]);
+  }, [searchText, searchRecords, loadRecords, getRecordCount]);
+
+  // ── 加载更多 ──
+  const loadMore = async () => {
+    if (loadingMore || isSearching) return;
+    setLoadingMore(true);
+    const pageOffset = offset;
+    lastPageRef.current = pageOffset;
+    try {
+      await loadRecords({ offset: pageOffset, limit: 100 });
+      setOffset(pageOffset + 100);
+    } catch (err: any) {
+      Alert.alert("加载失败", err?.message ?? "请稍后重试");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
 
   // ── 下拉刷新 ──
   const onRefresh = async () => {
     setRefreshing(true);
-    await loadRecords();
+    await refreshFirstPage();
     await loadExperimentOptions();
     setRefreshing(false);
   };
 
   // ── 切换项目折叠 ──
+  const projectTouchedRef = useRef(false);
   const toggleProject = (name: string) => {
+    projectTouchedRef.current = true;
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     setExpandedProjects((prev) => {
       const next = new Set(prev);
@@ -213,6 +316,8 @@ export default function RecordsScreen() {
     }
 
     const result = await ImagePicker.launchImageLibraryAsync({
+      // 安装版本 15.1.0 的 mediaTypes 类型与原生模块均为 MediaTypeOptions 枚举，
+      // 字符串数组 API（'images'）属 16.x，故此处保留枚举写法
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       quality: 0.8,
       selectionLimit: MAX_IMAGES - newImages.length,
@@ -240,9 +345,15 @@ export default function RecordsScreen() {
     }
   };
 
-  // ── 移除图片 ──
+  // ── 移除图片（同时清理已复制到应用目录的文件） ──
   const removeImage = (idx: number) => {
-    setNewImages((prev) => prev.filter((_, i) => i !== idx));
+    setNewImages((prev) => {
+      const removed = prev[idx];
+      if (removed && FileSystem.documentDirectory && removed.startsWith(FileSystem.documentDirectory)) {
+        deleteFileIfExists(removed).catch(() => {});
+      }
+      return prev.filter((_, i) => i !== idx);
+    });
   };
 
   // ── 拍照 ──
@@ -293,15 +404,21 @@ export default function RecordsScreen() {
         JSON.stringify(newImages)
       );
       // 同时保存到 record_images 表（供标注用）
+      let imgFail = false;
       for (const uri of newImages) {
-        try { await saveRecordImage(uri, recordId); } catch {}
+        try { await saveRecordImage(uri, recordId); } catch { imgFail = true; }
       }
       resetForm();
       setModalVisible(false);
-      Alert.alert("记录已保存", "是否需要关联样品？", [
-        { text: "稍后", style: "cancel" },
-        { text: "管理样品", onPress: () => router.push("/samples") },
-      ]);
+      if (imgFail) {
+        Alert.alert("提示", "记录已保存，但部分图片保存失败，标注功能可能不可用");
+      } else {
+        Alert.alert("记录已保存", "是否需要关联样品？", [
+          { text: "稍后", style: "cancel" },
+          { text: "管理样品", onPress: () => router.push("/samples") },
+        ]);
+      }
+      refreshFirstPage();
     } catch (err: any) {
       Alert.alert("错误", err.message ?? "保存失败");
     }
@@ -323,7 +440,7 @@ export default function RecordsScreen() {
     setAnnotatorVisible(true);
   };
 
-  // ── 删除记录 ──
+  // ── 删除记录（同步清理磁盘图片文件与 record_images 行） ──
   const handleDelete = (rec: RecordWithMeta) => {
     Alert.alert("确认删除", `确定要删除记录「${rec.title || "无标题"}」吗？`, [
       { text: "取消", style: "cancel" },
@@ -331,10 +448,28 @@ export default function RecordsScreen() {
         text: "删除",
         style: "destructive",
         onPress: async () => {
+          if (deletingId !== null) return;
+          setDeletingId(rec.id);
           try {
+            const rimgs = await getImagesForRecord(rec.id);
+            for (const img of rimgs) {
+              try { await deleteFileIfExists(img.original_path); } catch {}
+              if (img.annotated_path) {
+                try { await deleteFileIfExists(img.annotated_path); } catch {}
+              }
+            }
+            const jsonUris = parseImages(rec.images_json);
+            for (const uri of jsonUris) {
+              if (FileSystem.documentDirectory && uri.startsWith(FileSystem.documentDirectory)) {
+                try { await deleteFileIfExists(uri); } catch {}
+              }
+            }
             await deleteRecord(rec.id);
+            refreshFirstPage();
           } catch (err: any) {
             Alert.alert("错误", err.message ?? "删除失败");
+          } finally {
+            setDeletingId(null);
           }
         },
       },
@@ -400,7 +535,11 @@ export default function RecordsScreen() {
                 <Ionicons name="share-outline" size={16} color="#3b82f6" />
               </TouchableOpacity>
               <TouchableOpacity className="p-1" onPress={() => handleDelete(rec)}>
-                <Ionicons name="trash-outline" size={16} color="#ef4444" />
+                {deletingId === rec.id ? (
+                  <ActivityIndicator size="small" color="#ef4444" />
+                ) : (
+                  <Ionicons name="trash-outline" size={16} color="#ef4444" />
+                )}
               </TouchableOpacity>
             </View>
           </View>
@@ -452,7 +591,9 @@ export default function RecordsScreen() {
                       onPress={(e) => { e.stopPropagation?.();
                         // Load record images and open annotator
                         getImagesForRecord(rec.id).then((rimgs) => {
-                          if (rimgs[idx]) openAnnotator(rimgs[idx]);
+                          if (rimgs.length > 0) {
+                            openAnnotator(rimgs[Math.min(idx, rimgs.length - 1)]);
+                          }
                         });
                       }}>
                       <Ionicons name="pencil" size={10} color="white" />
@@ -475,8 +616,18 @@ export default function RecordsScreen() {
   // 渲染
   // ════════════════════════════════════════════════════════════
 
-  const dateGroups = getDateGroups();
-  const projectGroups = getProjectGroups();
+  const dateGroups = useMemo(() => groupByDate(allRecords), [allRecords]);
+  const projectGroups = useMemo(() => groupByProject(allRecords), [allRecords]);
+
+  // ── 首次加载数据时默认展开第一个项目（用户手动折叠后不再干预） ──
+  useEffect(() => {
+    if (projectTouchedRef.current) return;
+    setExpandedProjects((prev) => {
+      if (prev.size > 0) return prev;
+      const first = projectGroups[0]?.project_name;
+      return first ? new Set([first]) : prev;
+    });
+  }, [projectGroups]);
 
   return (
     <SafeAreaView className="flex-1 bg-gray-50" edges={["top"]}>
@@ -486,7 +637,7 @@ export default function RecordsScreen() {
           <View>
             <Text className="text-2xl font-bold text-gray-900">实验记录</Text>
             <Text className="text-gray-400 text-sm mt-0.5">
-              {records.length} 条记录
+              {isSearching ? allRecords.length : totalCount || allRecords.length} 条记录
               {isSearching ? ` · 搜索中` : ""}
             </Text>
           </View>
@@ -587,7 +738,7 @@ export default function RecordsScreen() {
         }
       >
         {/* 空状态 */}
-        {!loading && records.length === 0 && (
+        {!loading && allRecords.length === 0 && (
           <View className="items-center py-16">
             <View className="w-20 h-20 rounded-full bg-blue-50 items-center justify-center mb-4">
               <Ionicons name="document-text-outline" size={40} color="#93c5fd" />
@@ -648,8 +799,7 @@ export default function RecordsScreen() {
         {viewMode === "project" &&
           projectGroups.map((group: ProjectGroup) => {
             const isOpen =
-              expandedProjects.has(group.project_name) ||
-              expandedProjects.size === 0; // 首次默认全展开
+              expandedProjects.has(group.project_name);
             return (
               <View key={group.project_name} className="mb-3">
                 {/* 项目标题 */}
@@ -696,6 +846,24 @@ export default function RecordsScreen() {
               </View>
             );
           })}
+
+        {/* 加载更多 */}
+        {!isSearching && totalCount > 0 && allRecords.length < totalCount && (
+          <TouchableOpacity
+            className="bg-white rounded-2xl py-3.5 mb-3 items-center border border-gray-100"
+            activeOpacity={0.8}
+            disabled={loadingMore}
+            onPress={loadMore}
+          >
+            {loadingMore ? (
+              <ActivityIndicator size="small" color="#3b82f6" />
+            ) : (
+              <Text className="text-primary-600 text-sm font-semibold">
+                加载更多（{allRecords.length}/{totalCount}）
+              </Text>
+            )}
+          </TouchableOpacity>
+        )}
 
         <View className="h-6" />
       </ScrollView>

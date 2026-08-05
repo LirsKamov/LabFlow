@@ -8,8 +8,15 @@
  *  - 自动检测可变字段（detectVariableFields）
  */
 
-import * as SQLite from "expo-sqlite";
+import { getDb, withTransaction } from "../db/database";
 import type { VariableField, SopStep } from "../db/schema";
+
+// ─── 工具 ────────────────────────────────────────────────────
+
+/** 转义正则特殊字符（用于把字面量 default 值拼进正则） */
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 // ─── 类型 ────────────────────────────────────────────────────
 
@@ -39,6 +46,10 @@ export interface TemplateFilter {
 
 /**
  * 保存实验为模板
+ *
+ * 占位符注入：对每个带 unit 且 default 非空的 variableField，把步骤文本中
+ * 出现的「default 值 + 可选空格」替换为 {{key}}，单位文字保留在占位符外
+ * （如 "10 μL" → "{{volume}} μL"），使 instantiateTemplate 的替换真正生效。
  */
 export async function saveAsTemplate(
   experimentId: number,
@@ -49,7 +60,7 @@ export async function saveAsTemplate(
   kitId?: number | null,
   reactionTemplateId?: number | null
 ): Promise<number> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
 
   // 深拷贝该实验的所有 sop_steps
   const steps = await db.getAllAsync<SopStep>(
@@ -57,11 +68,27 @@ export async function saveAsTemplate(
     [experimentId]
   );
 
+  // 把可变字段的默认值替换为 {{key}} 占位符（title / description 都处理）
+  const injectPlaceholders = (text: string, fields: VariableField[]): string => {
+    let out = text;
+    for (const f of fields) {
+      const defaultValue = (f.default ?? "").trim();
+      // 无单位或默认值为空的字段跳过——纯文本字段没有可靠的锚点，避免误替换
+      if (!defaultValue || !f.unit) continue;
+      const escDefault = escapeRegex(defaultValue);
+      const escUnit = escapeRegex(f.unit.trim());
+      // 匹配「默认值 + 可选空格」且后面紧跟单位（lookahead），单位文字保留
+      const re = new RegExp(`${escDefault}(\\s*)(?=${escUnit})`, "g");
+      out = out.replace(re, `{{${f.key}}}$1`);
+    }
+    return out;
+  };
+
   const sopStepsJson = JSON.stringify(
     steps.map((s) => ({
       step_num: s.step_num,
-      title: s.title,
-      description: s.description,
+      title: injectPlaceholders(s.title, variableFields),
+      description: injectPlaceholders(s.description, variableFields),
       duration_min: s.duration_min,
       timer_required: s.timer_required === 1,
     }))
@@ -81,6 +108,8 @@ export async function saveAsTemplate(
 
 /**
  * 实例化模板 → 创建新实验
+ *
+ * 「建实验 + 批量插步骤 + 使用次数 +1」包在单个事务中，失败整体回滚。
  */
 export async function instantiateTemplate(
   templateId: number,
@@ -88,7 +117,7 @@ export async function instantiateTemplate(
   scheduledDate: string,
   variables: Record<string, string>
 ): Promise<{ experimentId: number; name: string }> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
 
   const tmpl = await db.getFirstAsync<{
     name: string; sop_steps_json: string; kit_id: number | null;
@@ -102,8 +131,7 @@ export async function instantiateTemplate(
   // 替换步骤中的 {{key}} 占位符
   let stepsJson = tmpl.sop_steps_json;
   for (const [key, value] of Object.entries(variables)) {
-    const re = new RegExp(`\\{\\{${key}\\}\\}`, "g");
-    stepsJson = stepsJson.replace(re, value);
+    stepsJson = stepsJson.replace(new RegExp(`\\{\\{${escapeRegex(key)}\\}\\}`, "g"), value);
   }
 
   const steps: {
@@ -114,40 +142,42 @@ export async function instantiateTemplate(
   // 实验名也替换变量
   let expName = tmpl.name;
   for (const [key, value] of Object.entries(variables)) {
-    expName = expName.replace(new RegExp(`\\{\\{${key}\\}\\}`, "g"), value);
+    expName = expName.replace(new RegExp(`\\{\\{${escapeRegex(key)}\\}\\}`, "g"), value);
   }
 
-  // 创建实验
-  const expResult = await db.runAsync(
-    `INSERT INTO experiments (project_id, kit_id, reaction_template_id, name, scheduled_date, status)
-     VALUES (?, ?, ?, ?, ?, 'planned')`,
-    [projectId, tmpl.kit_id, tmpl.reaction_template_id, expName, scheduledDate]
-  );
-  const experimentId = expResult.lastInsertRowId;
-
-  // 批量插入步骤
-  for (const s of steps) {
-    await db.runAsync(
-      `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [experimentId, s.step_num, s.title, s.description, s.duration_min, s.timer_required ? 1 : 0]
+  return withTransaction(async (tx) => {
+    // 创建实验
+    const expResult = await tx.runAsync(
+      `INSERT INTO experiments (project_id, kit_id, reaction_template_id, name, scheduled_date, status)
+       VALUES (?, ?, ?, ?, ?, 'planned')`,
+      [projectId, tmpl.kit_id, tmpl.reaction_template_id, expName, scheduledDate]
     );
-  }
+    const experimentId = expResult.lastInsertRowId;
 
-  // 增加使用次数
-  await db.runAsync(
-    "UPDATE experiment_templates SET use_count = use_count + 1 WHERE id = ?",
-    [templateId]
-  );
+    // 批量插入步骤
+    for (const s of steps) {
+      await tx.runAsync(
+        `INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [experimentId, s.step_num, s.title, s.description, s.duration_min, s.timer_required ? 1 : 0]
+      );
+    }
 
-  return { experimentId, name: expName };
+    // 增加使用次数
+    await tx.runAsync(
+      "UPDATE experiment_templates SET use_count = use_count + 1 WHERE id = ?",
+      [templateId]
+    );
+
+    return { experimentId, name: expName };
+  });
 }
 
 /**
  * 获取模板列表（支持过滤）
  */
 export async function getTemplates(filter?: TemplateFilter): Promise<TemplateSummary[]> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
   let sql = `
     SELECT
       et.*,
@@ -184,7 +214,7 @@ export async function getTemplates(filter?: TemplateFilter): Promise<TemplateSum
  * 获取所有标签（去重）
  */
 export async function getAllTags(): Promise<string[]> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
   const rows = await db.getAllAsync<{ tags: string }>(
     "SELECT DISTINCT tags FROM experiment_templates WHERE tags != ''"
   );
@@ -205,7 +235,7 @@ export async function getAllTags(): Promise<string[]> {
 export async function detectVariableFields(
   experimentId: number
 ): Promise<VariableField[]> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
   const steps = await db.getAllAsync<{ title: string; description: string }>(
     "SELECT title, description FROM sop_steps WHERE experiment_id = ?",
     [experimentId]

@@ -81,8 +81,21 @@ CREATE TABLE IF NOT EXISTS sop_steps (
 );
 `;
 
-/** 数据库迁移（按版本累积） — 新建数据库无需执行，保留空数组供后续可能的结构变更 */
-export const MIGRATIONS: readonly string[] = [];
+/**
+ * 数据库迁移（按版本累积） — 新建数据库无需执行。
+ * 注意：_layout 启动时循环执行且 try/catch 吞错，重复执行不会崩，
+ * 但语句必须各自幂等（ALTER 重复执行会因 duplicate column 报错，由 catch 吞掉）。
+ */
+export const MIGRATIONS: readonly string[] = [
+  // 2026-08: usage_logs 增加操作类型列（use 消耗 / restock 补货 / adjust 纠错）
+  // 历史行默认 'use'；重复执行报 duplicate column，被 _layout 的 catch 吞掉
+  "ALTER TABLE usage_logs ADD COLUMN operation TEXT NOT NULL DEFAULT 'use';",
+  // 2026-08: 清理历史垃圾数据（幂等）
+  "DELETE FROM sop_steps WHERE experiment_id = 0;",
+  "DELETE FROM todos WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects);",
+  "DELETE FROM records WHERE experiment_id IS NOT NULL AND experiment_id NOT IN (SELECT id FROM experiments);",
+  "DELETE FROM usage_logs WHERE component_id NOT IN (SELECT id FROM kit_components);",
+];
 
 /** 实验记录表 */
 export const CREATE_RECORDS = `
@@ -237,6 +250,7 @@ export interface UsageLog {
   used_qty: number;
   unit: string;
   used_at: string;
+  operation: 'use' | 'restock' | 'adjust';
   note: string;
 }
 

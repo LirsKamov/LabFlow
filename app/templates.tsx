@@ -7,7 +7,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../db/database";
+import { toLocalDateString } from "../utils/date";
 import DatePickerField from "../components/DatePickerField";
 import {
   getTemplates, getAllTags, instantiateTemplate,
@@ -82,7 +83,9 @@ export default function TemplatesScreen() {
   // Auto-detect fields for save-as-template
   useEffect(() => {
     if (saveFromExpId) {
-      detectVariableFields(saveFromExpId).then(setSaveFields);
+      detectVariableFields(saveFromExpId)
+        .then(setSaveFields)
+        .catch((e: any) => Alert.alert("字段检测失败", e?.message ?? "请手动输入字段"));
     }
   }, [saveFromExpId]);
 
@@ -99,7 +102,7 @@ export default function TemplatesScreen() {
     } catch { setInstVars({}); }
     // Load projects
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const rows = await db.getAllAsync<{ id: number; name: string }>(
         "SELECT id, name FROM projects WHERE status = 'active' ORDER BY name"
       );
@@ -112,10 +115,11 @@ export default function TemplatesScreen() {
   const handleInstantiate = async () => {
     if (!instantiating) return;
     try {
-      const { experimentId } = await instantiateTemplate(
-        instantiating.id, instProjectId, instDate.toISOString().split("T")[0], instVars
+      // toLocalDateString 取本地时区日期（toISOString 会差一天）
+      const { experimentId, name } = await instantiateTemplate(
+        instantiating.id, instProjectId, toLocalDateString(instDate), instVars
       );
-      Alert.alert("创建成功", `实验已创建`, [
+      Alert.alert("创建成功", `已创建实验「${name}」（ID: ${experimentId}）`, [
         { text: "查看", onPress: () => { setInstantiating(null); router.back(); } },
       ]);
     } catch (e: any) {
@@ -237,11 +241,18 @@ export default function TemplatesScreen() {
               <View className="flex-row items-center mt-3 space-x-4">
                 <Text className="text-gray-400 text-xs">{tmpl.step_count} 步</Text>
                 <Text className="text-gray-400 text-xs">使用 {tmpl.use_count} 次</Text>
-                <Text className="text-gray-400 text-xs">{tmpl.created_at?.split(" ")[0]}</Text>
+                <Text className="text-gray-400 text-xs">{tmpl.created_at ? tmpl.created_at.split(" ")[0] : ""}</Text>
               </View>
               <View className="flex-row mt-3 space-x-2">
                 <TouchableOpacity className="flex-1 bg-gray-100 py-2.5 rounded-xl items-center" onPress={() => {
-                  Alert.alert("步骤预览", `共 ${tmpl.step_count} 个步骤。模板创建于 ${tmpl.created_at}`);
+                  let stepList = "无步骤";
+                  try {
+                    const steps = JSON.parse(tmpl.sop_steps_json || "[]") as any[];
+                    if (steps.length > 0) {
+                      stepList = steps.map((s: any, i: number) => `${s.step_num ?? i + 1}. ${s.title ?? "未命名步骤"}${s.duration_min ? `（${s.duration_min}min）` : ""}`).join("\n");
+                    }
+                  } catch {}
+                  Alert.alert("步骤预览", stepList);
                 }}>
                   <Text className="text-gray-600 text-sm font-semibold">查看步骤</Text>
                 </TouchableOpacity>
@@ -277,6 +288,9 @@ export default function TemplatesScreen() {
                     </TouchableOpacity>
                   ))}
                 </ScrollView>
+                {instProjects.length === 0 && (
+                  <Text className="text-gray-400 text-xs mb-4">暂无项目，请先创建</Text>
+                )}
                 {/* 日期 */}
                 <DatePickerField date={instDate} onDateChange={(s) => setInstDate(new Date(s))} label="实验日期" />
                 {/* 变量表单 */}

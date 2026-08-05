@@ -4,13 +4,15 @@
  * 支持：PDF 报告 / Excel 数据表 / ZIP 归档
  */
 
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../db/database";
+import { toLocalDateString } from "../utils/date";
 import * as FileSystem from "expo-file-system";
 import * as Print from "expo-print";
 import * as Sharing from "expo-sharing";
 import * as XLSX from "xlsx";
 import JSZip from "jszip";
-import type { Experiment, SopStep, Record, Sample, Kit, KitComponent, RecordImage, Annotation } from "../db/schema";
+import { deleteFileIfExists } from "../utils/file";
+import type { Experiment, SopStep, Record as ExperimentRecord, Sample, Kit, KitComponent, RecordImage, Annotation } from "../db/schema";
 
 const EXPORT_DIR = `${FileSystem.documentDirectory}exports/`;
 
@@ -26,7 +28,7 @@ async function imageToBase64(path: string): Promise<string> {
 }
 
 function todayStr(): string {
-  return new Date().toISOString().split("T")[0];
+  return toLocalDateString();
 }
 
 function nowCN(): string {
@@ -40,7 +42,7 @@ function nowCN(): string {
 function buildExperimentHTML(
   exp: Experiment & { project_name?: string; kit_name?: string },
   steps: SopStep[],
-  records: Record[],
+  records: ExperimentRecord[],
   images: RecordImage[],
   samples: (Sample & { project_name?: string })[],
   sampleLogs: any[]
@@ -167,7 +169,7 @@ export async function generateExperimentReport(
   experimentId: number
 ): Promise<string> {
   await ensureExportDir();
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
 
   // Fetch all data
   const exp = await db.getFirstAsync<any>(
@@ -180,7 +182,7 @@ export async function generateExperimentReport(
   const steps = await db.getAllAsync<SopStep>(
     "SELECT * FROM sop_steps WHERE experiment_id = ? ORDER BY step_num ASC", [experimentId]
   );
-  const records = await db.getAllAsync<Record>(
+  const records = await db.getAllAsync<ExperimentRecord>(
     "SELECT * FROM records WHERE experiment_id = ? ORDER BY created_at ASC", [experimentId]
   );
   const images = await db.getAllAsync<RecordImage>(
@@ -216,7 +218,7 @@ export async function generateExcelExport(
   scope: "all" | { projectId: number }
 ): Promise<string> {
   await ensureExportDir();
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
 
   let expFilter = "";
   const params: any[] = [];
@@ -304,29 +306,37 @@ export async function generateZipExport(
   includeImages: boolean = true
 ): Promise<string> {
   await ensureExportDir();
+  const db = await getDb();
   const zip = new JSZip();
 
   // 1. PDF reports per experiment
+  //    generateExperimentReport 会落盘到 EXPORT_DIR，读入内存后立即删除，
+  //    避免中间文件污染导出历史。
   for (const eid of experimentIds) {
+    let pdfPath = "";
     try {
-      const pdfPath = await generateExperimentReport(eid);
+      pdfPath = await generateExperimentReport(eid);
       const pdfBase64 = await FileSystem.readAsStringAsync(pdfPath, { encoding: FileSystem.EncodingType.Base64 });
-      const exp = await (await SQLite.openDatabaseAsync("labflow.db")).getFirstAsync<{ name: string }>("SELECT name FROM experiments WHERE id = ?", [eid]);
+      const exp = await db.getFirstAsync<{ name: string }>("SELECT name FROM experiments WHERE id = ?", [eid]);
       const safeName = (exp?.name || `experiment_${eid}`).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, "_").slice(0, 40);
       zip.file(`reports/${safeName}.pdf`, pdfBase64, { base64: true });
-    } catch {}
+    } catch (e) { console.error(`[zip] 实验 ${eid} PDF 导出失败`, e); }
+    finally { if (pdfPath) await deleteFileIfExists(pdfPath); }
   }
 
   // 2. Excel
+  let xlsxPath = "";
   try {
-    const xlsxPath = await generateExcelExport("all");
+    xlsxPath = await generateExcelExport("all");
     const xlsxBase64 = await FileSystem.readAsStringAsync(xlsxPath, { encoding: FileSystem.EncodingType.Base64 });
     zip.file("data/labflow_data.xlsx", xlsxBase64, { base64: true });
-  } catch {}
+  } catch (e) { console.error("[zip] Excel 导出失败", e); }
+  finally { if (xlsxPath) await deleteFileIfExists(xlsxPath); }
 
-  // 3. Images (optional)
+  // 3. Images (optional) + 标注 JSON
+  //    annotated_path 已恒为 null（annotationService 不再落盘标注图），
+  //    标注改为导出 annotations_json 原始数据。
   if (includeImages) {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
     for (const eid of experimentIds) {
       const exp = await db.getFirstAsync<{ name: string }>("SELECT name FROM experiments WHERE id = ?", [eid]);
       const safeExp = (exp?.name || `exp_${eid}`).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, "_").slice(0, 30);
@@ -336,19 +346,23 @@ export async function generateZipExport(
       for (const img of images) {
         try {
           const b64 = await imageToBase64(img.original_path);
-          zip.file(`images/originals/${safeExp}/${img.id}.jpg`, b64, { base64: true });
-          if (img.annotated_path) {
-            const ab64 = await imageToBase64(img.annotated_path);
-            zip.file(`images/annotated/${safeExp}/${img.id}_annotated.png`, ab64, { base64: true });
+          if (b64) zip.file(`images/originals/${safeExp}/${img.id}.jpg`, b64, { base64: true });
+          const annotations: Annotation[] = (() => { try { return JSON.parse(img.annotations_json || "[]"); } catch { return []; } })();
+          if (Array.isArray(annotations) && annotations.length > 0) {
+            zip.file(`images/annotations/${safeExp}/${img.id}.json`, JSON.stringify(annotations, null, 2));
           }
-        } catch {}
+        } catch (e) { console.error("[zip] 图片打包失败", e); }
       }
     }
   }
 
-  // 4. Raw JSON
-  const db = await SQLite.openDatabaseAsync("labflow.db");
-  const rawExps = await db.getAllAsync<any>("SELECT * FROM experiments WHERE id IN (" + experimentIds.join(",") + ")");
+  // 4. Raw JSON（参数化 IN 查询）
+  const rawExps = experimentIds.length > 0
+    ? await db.getAllAsync<any>(
+        `SELECT * FROM experiments WHERE id IN (${experimentIds.map(() => "?").join(",")})`,
+        experimentIds
+      )
+    : [];
   zip.file("raw/experiments.json", JSON.stringify(rawExps, null, 2));
 
   const zipBase64 = await zip.generateAsync({ type: "base64" });

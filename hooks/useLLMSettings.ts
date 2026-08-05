@@ -2,7 +2,6 @@ import { useState, useCallback, useEffect } from "react";
 import {
   saveLLMSettings,
   getLLMSettings,
-  hasLLMConfig,
   type LLMProvider,
   type LLMSettings,
 } from "../services/llm";
@@ -21,17 +20,15 @@ export function useLLMSettings() {
   const [configured, setConfigured] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  // ── 从 AsyncStorage 加载 ──
+  // ── 从 SecureStore 加载（单次读取，getLLMSettings 为空即未配置） ──
   const loadSettings = useCallback(async () => {
     setLoading(true);
     try {
       const saved = await getLLMSettings();
       if (saved) {
         setSettings(saved);
-        setConfigured(true);
       }
-      const has = await hasLLMConfig();
-      setConfigured(has);
+      setConfigured(saved !== null);
     } catch (err) {
       console.error("[useLLMSettings] 加载失败:", err);
     } finally {
@@ -49,7 +46,7 @@ export function useLLMSettings() {
       const updated = { ...settings, ...partial };
       await saveLLMSettings(updated);
       setSettings(updated);
-      if (updated.apiKey) setConfigured(true);
+      setConfigured(updated.apiKey.length > 0);
     },
     [settings]
   );
@@ -67,7 +64,9 @@ export function useLLMSettings() {
         model: defaultModels[provider],
       } as LLMSettings;
       setSettings(updated);
-      saveLLMSettings(updated);
+      saveLLMSettings(updated).catch((err) => {
+        console.error("[useLLMSettings] 保存失败:", err);
+      });
     },
     [settings]
   );
@@ -79,7 +78,11 @@ export function useLLMSettings() {
       apiKey: "",
       model: "claude-sonnet-4-20250514",
     };
-    await saveLLMSettings(cleared);
+    try {
+      await saveLLMSettings(cleared);
+    } catch (err) {
+      console.error("[useLLMSettings] 清除失败:", err);
+    }
     setSettings(cleared);
     setConfigured(false);
   }, []);

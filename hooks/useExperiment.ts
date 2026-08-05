@@ -1,5 +1,7 @@
-import { useState, useCallback } from "react";
-import * as SQLite from "expo-sqlite";
+import { useState, useCallback, useMemo } from "react";
+import { Alert } from "react-native";
+import { getDb } from "../db/database";
+import { todayLocal } from "../utils/date";
 import type { Experiment, SopStep } from "../db/schema";
 
 /**
@@ -24,8 +26,8 @@ export function useExperiment() {
   const loadTodayExperiments = useCallback(async () => {
     setLoading(true);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      const today = new Date().toISOString().split("T")[0];
+      const db = await getDb();
+      const today = todayLocal();
       const rows = await db.getAllAsync<Experiment>(
         `SELECT * FROM experiments
          WHERE scheduled_date = ? AND status != 'cancelled'
@@ -51,7 +53,7 @@ export function useExperiment() {
   const loadAllExperiments = useCallback(async () => {
     setLoading(true);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const rows = await db.getAllAsync<Experiment>(
         `SELECT * FROM experiments
          WHERE status != 'cancelled'
@@ -71,7 +73,7 @@ export function useExperiment() {
     setSelectedExperiment(exp);
     setLoading(true);
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      const db = await getDb();
       const rows = await db.getAllAsync<SopStep>(
         `SELECT * FROM sop_steps
          WHERE experiment_id = ?
@@ -99,27 +101,32 @@ export function useExperiment() {
       if (!step) return;
 
       const newVal = step.completed === 1 ? 0 : 1;
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      await db.runAsync(
-        `UPDATE sop_steps
-         SET completed = ?,
-             completed_at = ?
-         WHERE id = ?`,
-        [newVal, newVal === 1 ? new Date().toISOString() : null, stepId]
-      );
+      try {
+        const db = await getDb();
+        await db.runAsync(
+          `UPDATE sop_steps
+           SET completed = ?,
+               completed_at = ?
+           WHERE id = ?`,
+          [newVal, newVal === 1 ? new Date().toISOString() : null, stepId]
+        );
 
-      // 更新本地状态
-      setSteps((prev) =>
-        prev.map((s) =>
-          s.id === stepId
-            ? {
-                ...s,
-                completed: newVal as 0 | 1,
-                completed_at: newVal === 1 ? new Date().toISOString() : null,
-              }
-            : s
-        )
-      );
+        // 更新本地状态
+        setSteps((prev) =>
+          prev.map((s) =>
+            s.id === stepId
+              ? {
+                  ...s,
+                  completed: newVal as 0 | 1,
+                  completed_at: newVal === 1 ? new Date().toISOString() : null,
+                }
+              : s
+          )
+        );
+      } catch (err) {
+        console.error("[useExperiment] 切换步骤状态失败:", err);
+        Alert.alert("操作失败", "更新步骤状态失败，请重试");
+      }
     },
     [steps]
   );
@@ -127,44 +134,60 @@ export function useExperiment() {
   // ── 更新步骤备注 ──
   const updateStepNotes = useCallback(
     async (stepId: number, notes: string): Promise<void> => {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      await db.runAsync("UPDATE sop_steps SET notes = ? WHERE id = ?", [
-        notes,
-        stepId,
-      ]);
-      setSteps((prev) =>
-        prev.map((s) => (s.id === stepId ? { ...s, notes } : s))
-      );
+      try {
+        const db = await getDb();
+        await db.runAsync("UPDATE sop_steps SET notes = ? WHERE id = ?", [
+          notes,
+          stepId,
+        ]);
+        setSteps((prev) =>
+          prev.map((s) => (s.id === stepId ? { ...s, notes } : s))
+        );
+      } catch (err) {
+        console.error("[useExperiment] 更新备注失败:", err);
+        Alert.alert("保存失败", "备注保存失败，请重试");
+      }
     },
     []
   );
 
-  // ── 更新实验状态 ──
+  // ── 更新实验状态（乐观更新，不重查数据库，保持当前视图数据） ──
   const updateExperimentStatus = useCallback(
-    async (expId: number, status: Experiment["status"]) => {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
-      await db.runAsync(
-        `UPDATE experiments
-         SET status = ?, updated_at = datetime('now','localtime')
-         WHERE id = ?`,
-        [status, expId]
-      );
-      setSelectedExperiment((prev) =>
-        prev?.id === expId ? { ...prev, status } : prev
-      );
-      // 刷新列表
-      await loadTodayExperiments();
+    async (expId: number, status: Experiment["status"]): Promise<void> => {
+      try {
+        const db = await getDb();
+        await db.runAsync(
+          `UPDATE experiments
+           SET status = ?, updated_at = datetime('now','localtime')
+           WHERE id = ?`,
+          [status, expId]
+        );
+        // 乐观更新本地列表与选中实验
+        setExperiments((prev) =>
+          prev.map((e) => (e.id === expId ? { ...e, status } : e))
+        );
+        setSelectedExperiment((prev) =>
+          prev?.id === expId ? { ...prev, status } : prev
+        );
+      } catch (err) {
+        console.error("[useExperiment] 更新实验状态失败:", err);
+        Alert.alert("操作失败", "更新实验状态失败，请重试");
+      }
     },
-    [loadTodayExperiments]
+    []
   );
 
   // ── 总体进度 ──
-  const overallProgress = ((): { done: number; total: number; percent: number } => {
+  const overallProgress = useMemo((): {
+    done: number;
+    total: number;
+    percent: number;
+  } => {
     const total = steps.length;
     const done = steps.filter((s) => s.completed === 1).length;
     const percent = total === 0 ? 0 : Math.round((done / total) * 100);
     return { done, total, percent };
-  })();
+  }, [steps]);
 
   return {
     experiments,

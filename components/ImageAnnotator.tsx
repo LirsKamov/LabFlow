@@ -1,7 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import {
   View, Text, TouchableOpacity, Image, TextInput, Alert,
-  Dimensions, PanResponder, GestureResponderEvent,
+  PanResponder, GestureResponderEvent, useWindowDimensions,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
 import Svg, {
@@ -24,10 +24,23 @@ interface DraftAnnotation {
   strokeWidth: number;
 }
 
+interface DragState {
+  id: string;
+  grantX: number;
+  grantY: number;
+  baseX: number;
+  baseY: number;
+}
+
 const COLORS = ["#E8503A", "#3B8BD4", "#10B981", "#F59E0B"];
 const STROKE_WIDTHS = [1, 2, 4];
 
-const { width: SCREEN_W } = Dimensions.get("window");
+// Module-level id counter to avoid same-millisecond collisions
+let idSeq = 0;
+function nextId(prefix: string): string {
+  idSeq += 1;
+  return `${prefix}${Date.now()}_${idSeq}`;
+}
 
 // ─── Component ──────────────────────────────────────────────
 
@@ -43,6 +56,7 @@ interface Props {
 export default function ImageAnnotator({
   imageId, imageUri, imgWidth, imgHeight, onSave, onClose,
 }: Props) {
+  const { width: winW, height: winH } = useWindowDimensions();
   const [tool, setTool] = useState<ToolType>("arrow");
   const [color, setColor] = useState(COLORS[0]);
   const [strokeW, setStrokeW] = useState(2);
@@ -53,27 +67,49 @@ export default function ImageAnnotator({
   const [textInputVisible, setTextInputVisible] = useState(false);
   const [textInputPos, setTextInputPos] = useState({ x: 0, y: 0 });
   const [textValue, setTextValue] = useState("");
-  const [imageViewSize, setImageViewSize] = useState({ w: SCREEN_W, h: 300 });
+  const [imageViewSize, setImageViewSize] = useState({ w: winW, h: 300 });
+  const [isSaving, setIsSaving] = useState(false);
 
-  // ── Load annotations ──
+  // ── Refs mirroring latest state (PanResponder is created once) ──
+  const toolRef = useRef<ToolType>(tool);
+  const colorRef = useRef(color);
+  const strokeWidthRef = useRef(strokeW);
+  const annotationsRef = useRef<Annotation[]>(annotations);
+  const selectedIdRef = useRef<string | null>(selectedId);
+  const draftRef = useRef<DraftAnnotation | null>(draft);
+  const dragRef = useRef<DragState | null>(null);
+  const loadSeqRef = useRef(0);
+  const originalRef = useRef<Annotation[]>([]);
+
+  // ── Load annotations (guarded against stale responses on image switch) ──
   useEffect(() => {
-    loadAnnotations(imageId).then(setAnnotations);
+    const seq = ++loadSeqRef.current;
+    loadAnnotations(imageId)
+      .then((list) => {
+        if (seq !== loadSeqRef.current) return; // stale response for a previous image
+        setAnnotations(list);
+        originalRef.current = list;
+      })
+      .catch((e: any) => {
+        if (seq !== loadSeqRef.current) return;
+        Alert.alert("加载失败", e?.message);
+      });
   }, [imageId]);
 
   // ── Calculate image display size (contain mode) ──
   const calcImageLayout = useCallback(() => {
-    const maxW = SCREEN_W;
-    const maxH = Dimensions.get("window").height * 0.55;
+    const maxW = winW;
+    const maxH = winH * 0.55;
     const ratio = Math.min(maxW / (imgWidth || 1), maxH / (imgHeight || 1));
     setImageViewSize({ w: (imgWidth || 400) * ratio, h: (imgHeight || 300) * ratio });
-  }, [imgWidth, imgHeight]);
+  }, [imgWidth, imgHeight, winW, winH]);
 
   useEffect(() => { calcImageLayout(); }, [calcImageLayout]);
 
   // ── Push history ──
-  const pushHistory = useCallback((anns: Annotation[]) => {
+  const pushHistory = (anns: Annotation[]) => {
     setHistory((prev) => [...prev.slice(-19), anns]);
-  }, []);
+  };
 
   // ── Undo ──
   const undo = () => {
@@ -97,7 +133,7 @@ export default function ImageAnnotator({
     setSelectedId(null);
   };
 
-  // ── Move annotation ──
+  // ── Move annotation (delta-based) ──
   const moveAnnotation = (id: string, dx: number, dy: number) => {
     setAnnotations((prev) =>
       prev.map((a) => {
@@ -116,24 +152,49 @@ export default function ImageAnnotator({
     );
   };
 
-  // ── PanResponder for drawing ──
+  // ── Move annotation (absolute anchor, used for finger-tracking drag) ──
+  const moveAnnotationTo = (id: string, nx: number, ny: number) => {
+    setAnnotations((prev) =>
+      prev.map((a) => {
+        if (a.id !== id) return a;
+        if (a.type === "arrow" || a.type === "line") {
+          const dx = nx - (a.x1 ?? 0);
+          const dy = ny - (a.y1 ?? 0);
+          return { ...a, x1: nx, y1: ny, x2: (a.x2 ?? 0) + dx, y2: (a.y2 ?? 0) + dy };
+        }
+        if (a.type === "circle") return { ...a, cx: nx, cy: ny };
+        return { ...a, x: nx, y: ny };
+      })
+    );
+  };
+
+  // ── Latest-function registry consumed by the stable PanResponder ──
+  const fnRef = useRef({
+    addAnnotation,
+    removeAnnotation,
+    moveAnnotation,
+    moveAnnotationTo,
+    pushHistory,
+  });
+
+  // ── PanResponder for drawing (created once; reads refs for live state) ──
   const panRef = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
       onPanResponderGrant: (e: GestureResponderEvent) => {
         const { locationX, locationY } = e.nativeEvent;
-        if (tool === "text") {
+        if (toolRef.current === "text") {
           setTextInputPos({ x: locationX, y: locationY });
           setTextValue("");
           setTextInputVisible(true);
           return;
         }
-        if (tool === "eraser") {
+        if (toolRef.current === "eraser") {
           // Find nearest annotation to click point
           let minDist = 30;
           let nearest: string | null = null;
-          for (const a of annotations) {
+          for (const a of annotationsRef.current) {
             const ax = a.type === "arrow" || a.type === "line" ? (a.x1 ?? 0) :
                        a.type === "circle" ? (a.cx ?? 0) : (a.x ?? 0);
             const ay = a.type === "arrow" || a.type === "line" ? (a.y1 ?? 0) :
@@ -141,38 +202,51 @@ export default function ImageAnnotator({
             const dist = Math.hypot(locationX - ax, locationY - ay);
             if (dist < minDist) { minDist = dist; nearest = a.id; }
           }
-          if (nearest) removeAnnotation(nearest);
+          if (nearest) fnRef.current.removeAnnotation(nearest);
           return;
         }
-        // Check if tapping on existing annotation to select
-        for (const a of annotations) {
+        // Check if tapping on existing annotation to select + prepare drag
+        for (const a of annotationsRef.current) {
           const ax = a.type === "arrow" || a.type === "line" ? (a.x1 ?? 0) : a.type === "circle" ? (a.cx ?? 0) : (a.x ?? 0);
           const ay = a.type === "arrow" || a.type === "line" ? (a.y1 ?? 0) : a.type === "circle" ? (a.cy ?? 0) : (a.y ?? 0);
           if (Math.hypot(locationX - ax, locationY - ay) < 20) {
             setSelectedId(a.id);
+            dragRef.current = { id: a.id, grantX: locationX, grantY: locationY, baseX: ax, baseY: ay };
             return;
           }
         }
         setSelectedId(null);
-        setDraft({ type: tool, x1: locationX, y1: locationY, x2: locationX, y2: locationY, color, strokeWidth: strokeW });
+        dragRef.current = null;
+        const d: DraftAnnotation = {
+          type: toolRef.current, x1: locationX, y1: locationY, x2: locationX, y2: locationY,
+          color: colorRef.current, strokeWidth: strokeWidthRef.current,
+        };
+        draftRef.current = d;
+        setDraft(d);
       },
       onPanResponderMove: (e: GestureResponderEvent) => {
-        if (!draft) {
-          // Drag selected annotation
-          if (selectedId) {
-            const { dx, dy } = e.nativeEvent as any;
-            if (Math.abs(dx || 0) + Math.abs(dy || 0) > 2) {
-              moveAnnotation(selectedId, (dx || 0) * 0.3, (dy || 0) * 0.3);
-            }
-          }
+        if (draftRef.current) {
+          const next = { ...draftRef.current, x2: e.nativeEvent.locationX, y2: e.nativeEvent.locationY };
+          draftRef.current = next;
+          setDraft(next);
           return;
         }
-        setDraft((prev) => prev ? { ...prev, x2: e.nativeEvent.locationX, y2: e.nativeEvent.locationY } : null);
+        // Drag selected annotation with finger tracking (absolute offset from grant point)
+        const drag = dragRef.current;
+        if (drag) {
+          const dx = e.nativeEvent.locationX - drag.grantX;
+          const dy = e.nativeEvent.locationY - drag.grantY;
+          if (Math.abs(dx) + Math.abs(dy) > 2) {
+            fnRef.current.moveAnnotationTo(drag.id, drag.baseX + dx, drag.baseY + dy);
+          }
+        }
       },
       onPanResponderRelease: () => {
-        if (!draft) return;
-        const { x1, y1, x2, y2, color: c, strokeWidth: sw, type: t } = draft;
-        const id = `a${Date.now()}`;
+        dragRef.current = null;
+        const d = draftRef.current;
+        if (!d) return;
+        const { x1, y1, x2, y2, color: c, strokeWidth: sw, type: t } = d;
+        const id = nextId("a");
         let ann: Annotation;
         switch (t) {
           case "arrow":
@@ -190,17 +264,38 @@ export default function ImageAnnotator({
           default: ann = { type: "arrow", id, x1, y1, x2, y2, color: c, strokeWidth: sw };
         }
         if (Math.abs(x2 - x1) > 3 || Math.abs(y2 - y1) > 3) {
-          addAnnotation(ann);
+          fnRef.current.addAnnotation(ann);
         }
+        draftRef.current = null;
+        setDraft(null);
+      },
+      onPanResponderTerminate: () => {
+        dragRef.current = null;
+        draftRef.current = null;
         setDraft(null);
       },
     })
   ).current;
 
+  // ── Sync latest values into refs on every render ──
+  toolRef.current = tool;
+  colorRef.current = color;
+  strokeWidthRef.current = strokeW;
+  annotationsRef.current = annotations;
+  selectedIdRef.current = selectedId;
+  draftRef.current = draft;
+  fnRef.current = {
+    addAnnotation,
+    removeAnnotation,
+    moveAnnotation,
+    moveAnnotationTo,
+    pushHistory,
+  };
+
   // ── Confirm text annotation ──
   const confirmText = () => {
     if (!textValue.trim()) { setTextInputVisible(false); return; }
-    const id = `t${Date.now()}`;
+    const id = nextId("t");
     addAnnotation({
       type: "text", id, x: textInputPos.x, y: textInputPos.y,
       text: textValue, color, fontSize: 14, fontWeight: "bold", strokeWidth: 0,
@@ -210,11 +305,28 @@ export default function ImageAnnotator({
 
   // ── Save ──
   const handleSave = async () => {
+    if (isSaving) return;
+    setIsSaving(true);
     try {
       await saveAnnotations(imageId, annotations);
+      originalRef.current = annotations;
       onSave();
     } catch (e: any) {
       Alert.alert("保存失败", e?.message);
+    } finally {
+      setIsSaving(false);
+    }
+  };
+
+  // ── Cancel with unsaved-changes guard ──
+  const handleCancel = () => {
+    if (JSON.stringify(annotations) !== JSON.stringify(originalRef.current)) {
+      Alert.alert("未保存的标注", "当前有未保存的标注，确定丢弃？", [
+        { text: "继续编辑", style: "cancel" },
+        { text: "丢弃", style: "destructive", onPress: onClose },
+      ]);
+    } else {
+      onClose();
     }
   };
 
@@ -228,13 +340,13 @@ export default function ImageAnnotator({
       case "arrow":
         return (
           <G key={a.id}>
-            <Line x1={a.x1} y1={a.y1} x2={a.x2} y2={a.y2} stroke={mainStroke} strokeWidth={mainSW} />
+            <Line x1={a.x1 ?? 0} y1={a.y1 ?? 0} x2={a.x2 ?? 0} y2={a.y2 ?? 0} stroke={mainStroke} strokeWidth={mainSW} />
             {/* Arrowhead */}
             <Polygon
-              points={`${a.x2},${a.y2} ${a.x2 - 8},${a.y2 - 4} ${a.x2 - 8},${a.y2 + 4}`}
+              points={`${a.x2 ?? 0},${a.y2 ?? 0} ${(a.x2 ?? 0) - 8},${(a.y2 ?? 0) - 4} ${(a.x2 ?? 0) - 8},${(a.y2 ?? 0) + 4}`}
               fill={mainStroke}
               rotation={Math.atan2((a.y2 ?? 0) - (a.y1 ?? 0), (a.x2 ?? 0) - (a.x1 ?? 0)) * (180 / Math.PI)}
-              origin={`${a.x2}, ${a.y2}`}
+              origin={`${a.x2 ?? 0}, ${a.y2 ?? 0}`}
             />
           </G>
         );
@@ -272,7 +384,7 @@ export default function ImageAnnotator({
     <View className="flex-1 bg-black">
       {/* ── Top Toolbar ── */}
       <View className="flex-row items-center justify-between px-3 py-2 bg-gray-900" style={{ height: 48 }}>
-        <TouchableOpacity onPress={onClose} className="px-2">
+        <TouchableOpacity onPress={handleCancel} className="px-2">
           <Text className="text-white text-sm">取消</Text>
         </TouchableOpacity>
 
@@ -280,7 +392,7 @@ export default function ImageAnnotator({
         <View className="flex-row space-x-1">
           {(["arrow", "circle", "rect", "text", "line", "eraser"] as ToolType[]).map((t) => {
             const icons: Record<ToolType, React.ComponentProps<typeof Ionicons>["name"]> = {
-              arrow: "arrow-up-right", circle: "ellipse-outline", rect: "square-outline",
+              arrow: "arrow-up-circle", circle: "ellipse-outline", rect: "square-outline",
               text: "text", line: "remove-outline", eraser: "backspace-outline",
             };
             return (
@@ -299,8 +411,8 @@ export default function ImageAnnotator({
             <TouchableOpacity key={c} className={`w-6 h-6 rounded-full ${color === c ? "border-2 border-white" : ""}`} style={{ backgroundColor: c }}
               onPress={() => setColor(c)} />
           ))}
-          <TouchableOpacity className="bg-blue-600 px-3 py-1.5 rounded-lg" onPress={handleSave}>
-            <Text className="text-white text-xs font-semibold">保存</Text>
+          <TouchableOpacity className={`bg-blue-600 px-3 py-1.5 rounded-lg ${isSaving ? "opacity-50" : ""}`} disabled={isSaving} onPress={handleSave}>
+            <Text className="text-white text-xs font-semibold">{isSaving ? "保存中..." : "保存"}</Text>
           </TouchableOpacity>
         </View>
       </View>

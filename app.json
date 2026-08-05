@@ -26,14 +26,11 @@
       },
       "package": "com.labflow.app",
       "versionCode": 1,
+      "allowBackup": false,
       "permissions": [
-        "SCHEDULE_EXACT_ALARM",
         "POST_NOTIFICATIONS",
         "VIBRATE",
-        "RECEIVE_BOOT_COMPLETED",
-        "READ_EXTERNAL_STORAGE",
-        "WRITE_EXTERNAL_STORAGE",
-        "READ_MEDIA_IMAGES"
+        "RECEIVE_BOOT_COMPLETED"
       ]
     },
     "web": {
@@ -42,7 +39,11 @@
     },
     "plugins": [
       "expo-router",
-      "expo-font"
+      "expo-font",
+      ["expo-image-picker", {
+        "photosPermission": "允许 LabFlow 访问相册以上传实验图片和试剂盒说明书",
+        "cameraPermission": "允许 LabFlow 使用相机拍摄实验图片和说明书"
+      }]
     ],
     "experiments": {
       "typedRoutes": true

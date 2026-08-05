@@ -6,9 +6,9 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router, useFocusEffect } from "expo-router";
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../db/database";
 import {
-  generateExperimentReport, generateExcelExport, generateZipExport,
+  generateExcelExport, generateZipExport,
   shareFile, listExportedFiles, deleteExportedFile,
 } from "../services/exportService";
 
@@ -27,13 +27,17 @@ export default function ExportScreen() {
   const [includeImages, setIncludeImages] = useState(true);
 
   const load = useCallback(async () => {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
-    const [projs, exps] = await Promise.all([
-      db.getAllAsync<{ id: number; name: string }>("SELECT id, name FROM projects WHERE status = 'active' ORDER BY name"),
-      db.getAllAsync<{ id: number; name: string; date: string }>("SELECT id, name, scheduled_date AS date FROM experiments WHERE status != 'cancelled' ORDER BY scheduled_date DESC LIMIT 50"),
-    ]);
-    setProjects(projs); setExperiments(exps);
-    setExportFiles(await listExportedFiles());
+    setLoading(true);
+    try {
+      const db = await getDb();
+      const [projs, exps] = await Promise.all([
+        db.getAllAsync<{ id: number; name: string }>("SELECT id, name FROM projects WHERE status = 'active' ORDER BY name"),
+        db.getAllAsync<{ id: number; name: string; date: string }>("SELECT id, name, scheduled_date AS date FROM experiments WHERE status != 'cancelled' ORDER BY scheduled_date DESC LIMIT 50"),
+      ]);
+      setProjects(projs); setExperiments(exps);
+      setExportFiles(await listExportedFiles());
+    } catch (e: any) { Alert.alert("加载失败", e?.message ?? "请重试"); }
+    finally { setLoading(false); }
   }, []);
 
   useFocusEffect(useCallback(() => { load(); }, [load]));
@@ -49,16 +53,11 @@ export default function ExportScreen() {
   const formatSize = (bytes: number) => bytes < 1024 * 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 
   // ── Export handlers ──
-  const handleExportPdfSingle = async (expId: number) => {
-    setExporting(`pdf_${expId}`);
-    try {
-      const path = await generateExperimentReport(expId);
-      await shareFile(path);
-    } catch (e: any) { Alert.alert("导出失败", e?.message); }
-    finally { setExporting(""); }
-  };
+  // 注：单个实验 PDF 导出（handleExportPdfSingle）已删除——无 UI 入口的死代码，
+  // 需要时在实验详情页直接调 generateExperimentReport（见 records.tsx）。
 
   const handleExportExcel = async () => {
+    if (exporting) return;
     setExporting("excel");
     try {
       const path = await generateExcelExport(selectedProjId ? { projectId: selectedProjId } : "all");
@@ -70,9 +69,12 @@ export default function ExportScreen() {
 
   const handleExportZip = async () => {
     if (selectedExpIds.size === 0) { Alert.alert("提示", "请选择至少一个实验"); return; }
+    if (exporting) return; // 防重复点击
     setExporting("zip");
+    Alert.alert("正在生成", "正在打包归档，实验较多时可能需要一段时间，请稍候…");
     try {
       const path = await generateZipExport(Array.from(selectedExpIds), includeImages);
+      Alert.alert("导出完成", "归档已生成，正在调起分享…");
       await shareFile(path);
       setExportFiles(await listExportedFiles());
     } catch (e: any) { Alert.alert("导出失败", e?.message); }
@@ -89,6 +91,7 @@ export default function ExportScreen() {
       </View>
 
       <ScrollView className="flex-1 px-4 pt-5" showsVerticalScrollIndicator={false}>
+        {loading ? <ActivityIndicator size="large" color="#3b82f6" style={{ marginTop: 60 }} /> : <>
         {/* ── Section 1: Single project ── */}
         <Text className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-3">单项目导出</Text>
         <View className="bg-white rounded-2xl p-5 mb-5 border border-gray-100">
@@ -103,8 +106,9 @@ export default function ExportScreen() {
               </TouchableOpacity>
             ))}
           </ScrollView>
+          {projects.length === 0 && <Text className="text-gray-400 text-xs mb-3">暂无项目，导出将包含全部实验</Text>}
           <View className="flex-row space-x-3">
-            <TouchableOpacity className="flex-1 bg-blue-50 py-3 rounded-xl items-center" onPress={handleExportExcel}>
+            <TouchableOpacity className="flex-1 bg-blue-50 py-3 rounded-xl items-center" onPress={handleExportExcel} disabled={!!exporting}>
               {exporting === "excel" ? <ActivityIndicator size="small" color="#3b82f6" /> : <><Ionicons name="grid-outline" size={18} color="#3b82f6" /><Text className="text-blue-700 text-xs font-semibold mt-1">导出 Excel</Text></>}
             </TouchableOpacity>
           </View>
@@ -123,13 +127,14 @@ export default function ExportScreen() {
               </TouchableOpacity>
             ))}
           </ScrollView>
+          <Text className="text-gray-300 text-xs mb-3">最多显示最近 50 个实验</Text>
           <View className="flex-row items-center justify-between mb-4">
             <Text className="text-sm text-gray-600">包含图片</Text>
             <TouchableOpacity className={`w-12 h-6 rounded-full ${includeImages ? "bg-primary-500" : "bg-gray-300"}`} onPress={() => setIncludeImages(!includeImages)}>
               <View className={`w-5 h-5 rounded-full bg-white mt-0.5 ${includeImages ? "ml-6" : "ml-0.5"}`} />
             </TouchableOpacity>
           </View>
-          <TouchableOpacity className="bg-purple-50 py-3 rounded-xl items-center" onPress={handleExportZip}>
+          <TouchableOpacity className="bg-purple-50 py-3 rounded-xl items-center" onPress={handleExportZip} disabled={!!exporting}>
             {exporting === "zip" ? <ActivityIndicator size="small" color="#8b5cf6" /> : <><Ionicons name="archive-outline" size={18} color="#8b5cf6" /><Text className="text-purple-700 text-xs font-semibold mt-1">导出 ZIP 归档</Text></>}
           </TouchableOpacity>
         </View>
@@ -153,6 +158,7 @@ export default function ExportScreen() {
             </View>
           ))}
         </View>
+        </>}
 
         <View className="h-6" />
       </ScrollView>

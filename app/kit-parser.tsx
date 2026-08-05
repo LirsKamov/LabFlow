@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import {
   View,
   Text,
@@ -21,8 +21,8 @@ import { router } from "expo-router";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system";
-import * as SQLite from "expo-sqlite";
-import { parseKitManual, readImageAsBase64, readPDFAsBase64, type ParsedKit, type ParsedComponent, type ParsedSopStep, type ParsedReactionTemplate } from "../services/kitParser";
+import { parseKitManual, parseKitText, readImageAsBase64, type ParsedKit, type ParsedComponent, type ParsedSopStep, type ParsedReactionTemplate } from "../services/kitParser";
+import { getDb, withTransaction } from "../db/database";
 
 if (Platform.OS === "android" && UIManager.setLayoutAnimationEnabledExperimental) {
   UIManager.setLayoutAnimationEnabledExperimental(true);
@@ -58,6 +58,27 @@ export default function KitParserScreen() {
   const [inventoryModal, setInventoryModal] = useState(false);
   const [inventoryQtys, setInventoryQtys] = useState<Record<number, string>>({});
   const [inventoryThresholds, setInventoryThresholds] = useState<Record<number, string>>({});
+
+  // 组件卸载标记：解析请求返回后不 setState，防止把用户拽回审核页
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  // kitName 输入框 ref（必填校验失败时 focus）
+  const kitNameRef = useRef<TextInput>(null);
+
+  // 解析阶段 → 百分比映射（OCR 分批 message 不改变百分比）
+  const STAGE_PCT: Record<string, number> = {
+    init: 5,
+    preprocess: 10,
+    ocr: 60,
+    parse: 90,
+    done: 100,
+  };
+  const stageToPct = (stage: string): number => STAGE_PCT[stage] ?? 0;
 
   // ── Upload: Pick Images ──
   const pickImages = async () => {
@@ -122,33 +143,50 @@ export default function KitParserScreen() {
     setParseProgress(0);
 
     try {
-      let input: string | string[];
+      // PDF：GLM-4V 无法解析 PDF，引导用户改用截图/文本
       if (pdfUri) {
-        const b64 = await readPDFAsBase64(pdfUri);
-        input = [b64];
-      } else if (images.length > 0) {
-        input = images;
-      } else if (textInput.trim()) {
-        input = textInput.trim();
-      } else {
-        setParseError("请上传说明书或输入文本");
         setStep("upload");
+        Alert.alert(
+          "暂不支持直接解析 PDF 说明书",
+          "请将说明书的页面截图/拍照上传，或使用文本粘贴模式"
+        );
         return;
       }
 
-      const result = await parseKitManual(input, (pct) => setParseProgress(pct));
-
-      if (!result.kit) {
-        setParseError(result.error ?? "解析失败");
-        setStep("upload");
+      // 图片模式：GLM-4V OCR → DeepSeek
+      if (images.length > 0) {
+        const result = await parseKitManual(images, {
+          onProgress: (stage, _msg) => {
+            if (isMountedRef.current) setParseProgress(stageToPct(stage));
+          },
+        });
+        if (!isMountedRef.current) return;
+        setKit(result);
+        setCatalogNo("");
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        setStep("review");
         return;
       }
 
-      setKit(result.kit);
-      setCatalogNo(result.kit.catalogNo ?? "");
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-      setStep("review");
+      // 纯文本模式：跳过 GLM，直接用 DeepSeek 解析
+      const text = textInput.trim();
+      if (text) {
+        const result = await parseKitText(text, (msg) => {
+          if (!isMountedRef.current) return;
+          setParseProgress(msg.includes("DeepSeek") ? 90 : 10);
+        });
+        if (!isMountedRef.current) return;
+        setKit(result);
+        setCatalogNo("");
+        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+        setStep("review");
+        return;
+      }
+
+      setParseError("请上传说明书或输入文本");
+      setStep("upload");
     } catch (err: any) {
+      if (!isMountedRef.current) return;
       setParseError(err?.message ?? "解析失败");
       setStep("upload");
     }
@@ -167,64 +205,126 @@ export default function KitParserScreen() {
   // ── Save to Database ──
   const handleSave = async () => {
     if (!kit) return;
+
+    // 表单校验：kitName 必填
+    const name = kit.kitName.trim();
+    if (!name) {
+      Alert.alert("提示", "试剂盒名称为必填项");
+      setStep("review");
+      setTimeout(() => kitNameRef.current?.focus(), 100);
+      return;
+    }
+
+    // 表单校验：库存量值必须为有限且 ≥ 0 的数字
+    const qtyValues = kit.components.map((_, i) => parseFloat(inventoryQtys[i] ?? "0"));
+    const threshValues = kit.components.map((_, i) => parseFloat(inventoryThresholds[i] ?? "0"));
+    if ([...qtyValues, ...threshValues].some((v) => !Number.isFinite(v) || v < 0)) {
+      Alert.alert("提示", "库存数量必须是不小于 0 的数字");
+      setStep("review");
+      return;
+    }
+
     setStep("saving");
+
     try {
-      const db = await SQLite.openDatabaseAsync("labflow.db");
+      // manual_pdf_path：复制到 documentDirectory 永久目录，避免 OS 清缓存失效
+      let manualPath: string | null = null;
+      if (pdfUri) {
+        try {
+          const dir = `${FileSystem.documentDirectory}manuals/`;
+          const dirInfo = await FileSystem.getInfoAsync(dir);
+          if (!dirInfo.exists) {
+            await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+          }
+          const target = `${dir}manual_${Date.now()}.pdf`;
+          await FileSystem.copyAsync({ from: pdfUri, to: target });
+          manualPath = target;
+        } catch {
+          manualPath = null;
+        }
+      }
 
-      // Insert kit
-      const kitResult = await db.runAsync(
-        "INSERT INTO kits (name, brand, catalog_no, manual_pdf_path, parsed_at) VALUES (?, ?, ?, ?, datetime('now','localtime'))",
-        [kit.kitName, kit.brand, catalogNo, pdfUri]
+      // 同名去重检测：存在则确认覆盖/取消
+      const db = await getDb();
+      const existing = await db.getFirstAsync<{ id: number }>(
+        "SELECT id FROM kits WHERE name = ? LIMIT 1",
+        [name]
       );
-      const kitId = kitResult.lastInsertRowId;
-
-      // Insert components
-      for (let i = 0; i < kit.components.length; i++) {
-        const c = kit.components[i];
-        const qty = parseFloat(inventoryQtys[i] ?? "0") || 0;
-        const thresh = parseFloat(inventoryThresholds[i] ?? "0") || 0;
-        await db.runAsync(
-          "INSERT INTO kit_components (kit_id, name, unit, initial_qty, current_qty, low_threshold, storage_condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          [kitId, c.name, c.unit, qty, qty, thresh, c.storage]
-        );
+      let overwriteId: number | null = null;
+      if (existing) {
+        const confirmed = await new Promise<boolean>((resolve) => {
+          Alert.alert("同名试剂盒已存在", `「${name}」已存在，是否覆盖并更新其数据？`, [
+            { text: "取消", style: "cancel", onPress: () => resolve(false) },
+            { text: "覆盖", style: "destructive", onPress: () => resolve(true) },
+          ]);
+        });
+        if (!confirmed) {
+          setStep("review");
+          return;
+        }
+        overwriteId = existing.id;
       }
 
-      // Insert SOP steps as template (experiment_id = 0)
-      for (const s of kit.sopSteps) {
-        await db.runAsync(
-          "INSERT INTO sop_steps (experiment_id, step_num, title, description, duration_min, timer_required) VALUES (0, ?, ?, ?, ?, ?)",
-          [s.step_num, s.title, s.description, s.duration_min, s.timer_required ? 1 : 0]
-        );
-      }
+      // 全部写入包在一个事务里：失败即整体回滚，不留孤儿数据
+      await withTransaction(async (tx) => {
+        let kitId: number;
+        if (overwriteId != null) {
+          kitId = overwriteId;
+          await tx.runAsync("DELETE FROM experiment_templates WHERE kit_id = ?", [kitId]);
+          await tx.runAsync("DELETE FROM reaction_templates WHERE kit_id = ?", [kitId]);
+          await tx.runAsync("DELETE FROM kit_components WHERE kit_id = ?", [kitId]);
+          await tx.runAsync(
+            "UPDATE kits SET brand = ?, catalog_no = ?, manual_pdf_path = ?, parsed_at = datetime('now','localtime') WHERE id = ?",
+            [kit.brand, catalogNo, manualPath, kitId]
+          );
+        } else {
+          const kitResult = await tx.runAsync(
+            "INSERT INTO kits (name, brand, catalog_no, manual_pdf_path, parsed_at) VALUES (?, ?, ?, ?, datetime('now','localtime'))",
+            [name, kit.brand, catalogNo, manualPath]
+          );
+          kitId = kitResult.lastInsertRowId;
+        }
 
-      // Insert reaction templates
-      for (const rt of kit.reactionTemplates) {
-        await db.runAsync(
-          "INSERT INTO reaction_templates (kit_id, template_name, total_vol_ul, components_json, source) VALUES (?, ?, ?, ?, 'parsed')",
-          [kitId, rt.name, rt.total_vol, JSON.stringify(rt.components)]
-        );
-      }
+        // Insert components
+        for (let i = 0; i < kit.components.length; i++) {
+          const c = kit.components[i];
+          const qty = parseFloat(inventoryQtys[i] ?? "0") || 0;
+          const thresh = parseFloat(inventoryThresholds[i] ?? "0") || 0;
+          await tx.runAsync(
+            "INSERT INTO kit_components (kit_id, name, unit, initial_qty, current_qty, low_threshold, storage_condition) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [kitId, c.name, c.unit, qty, qty, thresh, c.storage]
+          );
+        }
 
-      // Save SOP steps as an experiment_template for later import
-      if (kit.sopSteps.length > 0) {
-        const sopJson = JSON.stringify(kit.sopSteps.map((s) => ({
-          step_num: s.step_num,
-          title: s.title,
-          description: s.description,
-          duration_min: s.duration_min,
-          timer_required: s.timer_required,
-        })));
-        await db.runAsync(
-          "INSERT INTO experiment_templates (name, description, kit_id, sop_steps_json, tags, source_experiment_id) VALUES (?, ?, ?, ?, ?, ?)",
-          [`${kit.kitName} SOP`, `从 ${kit.brand || '试剂盒'} 说明书解析`, kitId, sopJson, 'kit-sop', null]
-        );
-      }
+        // Insert reaction templates
+        for (const rt of kit.reactionTemplates) {
+          await tx.runAsync(
+            "INSERT INTO reaction_templates (kit_id, template_name, total_vol_ul, components_json, source) VALUES (?, ?, ?, ?, 'parsed')",
+            [kitId, rt.name, rt.total_vol, JSON.stringify(rt.components)]
+          );
+        }
 
-      Alert.alert("保存成功", `试剂盒「${kit.kitName}」已保存`, [
-        { text: "确定", onPress: () => router.back() },
+        // SOP 步骤只存模板 JSON（不写 sop_steps 表，避免 experiment_id=0 悬空外键垃圾行）
+        if (kit.sopSteps.length > 0) {
+          const sopJson = JSON.stringify(kit.sopSteps.map((s) => ({
+            step_num: s.step_num,
+            title: s.title,
+            description: s.description,
+            duration_min: s.duration_min,
+            timer_required: s.timer_required,
+          })));
+          await tx.runAsync(
+            "INSERT INTO experiment_templates (name, description, kit_id, sop_steps_json, tags, source_experiment_id) VALUES (?, ?, ?, ?, ?, ?)",
+            [`${name} SOP`, `从 ${kit.brand || "试剂盒"} 说明书解析`, kitId, sopJson, "kit-sop", null]
+          );
+        }
+      });
+
+      Alert.alert("保存成功", `试剂盒「${name}」已保存`, [
+        { text: "查看试剂盒", onPress: () => router.back() },
       ]);
     } catch (err: any) {
-      Alert.alert("保存失败", err?.message ?? "请重试");
+      Alert.alert("保存失败，未写入任何数据", err?.message ?? "请重试");
       setStep("review");
     }
   };
@@ -258,7 +358,7 @@ export default function KitParserScreen() {
               <Ionicons name="document-text" size={32} color="#3b82f6" />
             </View>
             <Text className="text-primary-600 font-bold text-base">上传 PDF 说明书</Text>
-            <Text className="text-gray-400 text-sm mt-1">支持 PDF 格式的试剂盒说明书</Text>
+            <Text className="text-gray-400 text-sm mt-1">暂不支持直接解析，请将说明书页面截图后以图片上传</Text>
           </TouchableOpacity>
 
           {pdfUri && (
@@ -349,9 +449,9 @@ export default function KitParserScreen() {
           <Text className="text-gray-400 text-sm mt-2 text-center">AI 正在提取试剂盒信息、内容物、SOP 步骤和反应体系</Text>
           {/* Progress bar */}
           <View className="w-full h-2 bg-gray-200 rounded-full mt-8 overflow-hidden">
-            <View className="h-full bg-purple-500 rounded-full" style={{ width: `${Math.round(parseProgress * 100)}%` }} />
+            <View className="h-full bg-purple-500 rounded-full" style={{ width: `${parseProgress}%` }} />
           </View>
-          <Text className="text-gray-400 text-xs mt-2">{Math.round(parseProgress * 100)}%</Text>
+          <Text className="text-gray-400 text-xs mt-2">{parseProgress}%</Text>
         </View>
       </SafeAreaView>
     );
@@ -401,7 +501,7 @@ export default function KitParserScreen() {
             {expandedSections.has("info") && (
               <View>
                 <Label>名称 *</Label>
-                <TextInput className="input-field mb-3" value={kit.kitName} onChangeText={(t) => setKit({ ...kit, kitName: t })} />
+                <TextInput ref={kitNameRef} className="input-field mb-3" value={kit.kitName} onChangeText={(t) => setKit({ ...kit, kitName: t })} />
                 <Label>品牌</Label>
                 <TextInput className="input-field mb-3" value={kit.brand} onChangeText={(t) => setKit({ ...kit, brand: t })} />
                 <Label>货号</Label>

@@ -1,12 +1,15 @@
 import { useState, useEffect } from "react";
 import {
-  View, Text, ScrollView, TouchableOpacity, TextInput, Alert,
+  View, Text, ScrollView, TouchableOpacity, TextInput, Alert, ActivityIndicator,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { router } from "expo-router";
-import * as SQLite from "expo-sqlite";
+import * as FileSystem from "expo-file-system";
+import Constants from "expo-constants";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { getSecret, setSecret, deleteSecret } from "../utils/secureStore";
+import { getDb } from "../db/database";
 
 export default function SettingsScreen() {
   const [glmKey, setGlmKey] = useState("");
@@ -14,11 +17,12 @@ export default function SettingsScreen() {
   const [showGlm, setShowGlm] = useState(false);
   const [showDeepseek, setShowDeepseek] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
     (async () => {
       const [g, d] = await Promise.all([
-        AsyncStorage.getItem("api_key_glm"),
+        getSecret("api_key_glm"),
         AsyncStorage.getItem("api_key_deepseek"),
       ]);
       setGlmKey(g ?? "");
@@ -29,9 +33,9 @@ export default function SettingsScreen() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      await AsyncStorage.multiSet([
-        ["api_key_glm", glmKey.trim()],
-        ["api_key_deepseek", deepseekKey.trim()],
+      await Promise.all([
+        setSecret("api_key_glm", glmKey.trim()),
+        AsyncStorage.setItem("api_key_deepseek", deepseekKey.trim()),
       ]);
       Alert.alert("已保存", "API Key 已保存到本地设备");
     } catch (e: any) { Alert.alert("保存失败", e?.message); }
@@ -42,7 +46,8 @@ export default function SettingsScreen() {
     Alert.alert("清除设置", "确定清除所有 API Key？", [
       { text: "取消", style: "cancel" },
       { text: "清除", style: "destructive", onPress: async () => {
-        await AsyncStorage.multiRemove(["api_key_glm", "api_key_deepseek", "llm_provider", "llm_model"]);
+        await deleteSecret("api_key_glm");
+        await AsyncStorage.multiRemove(["api_key_deepseek", "llm_provider", "llm_model"]);
         setGlmKey(""); setDeepseekKey("");
       }},
     ]);
@@ -55,16 +60,37 @@ export default function SettingsScreen() {
         Alert.alert("最终确认", "你确定要清除 LabFlow 的全部数据吗？", [
           { text: "取消", style: "cancel" },
           { text: "我确定，清除全部", style: "destructive", onPress: async () => {
+            setClearing(true);
             try {
-              const db = await SQLite.openDatabaseAsync("labflow.db");
-              const tables = ["daily_plans","record_images","records","sop_steps","experiments","todos","projects","sample_usage_logs","samples","usage_logs","kit_components","reaction_templates","experiment_templates","kits"];
+              const db = await getDb();
+              // 子表优先删除（外键依赖顺序）
+              const tables = ["sop_steps","record_images","records","usage_logs","sample_usage_logs","kit_components","reaction_templates","experiment_templates","samples","experiments","todos","daily_plans","projects","kits"];
+              const failed: string[] = [];
               for (const t of tables) {
-                try { await db.execAsync(`DELETE FROM ${t}`); } catch {}
+                try { await db.execAsync(`DELETE FROM ${t}`); }
+                catch (e) { failed.push(t); }
               }
-              await AsyncStorage.multiRemove(["api_key_glm", "api_key_deepseek", "llm_provider", "llm_model"]);
+              try {
+                await db.execAsync(`DELETE FROM sqlite_sequence WHERE name IN (${tables.map(t => `'${t}'`).join(",")})`);
+              } catch (e) { failed.push("sqlite_sequence"); }
+              // 删除应用私有目录下的导出与图片文件（目录不存在时静默跳过）
+              for (const dir of ["exports", "images", "manuals"]) {
+                try {
+                  const path = `${FileSystem.documentDirectory}${dir}/`;
+                  await FileSystem.deleteAsync(path, { idempotent: true });
+                  await FileSystem.makeDirectoryAsync(path, { intermediates: true });
+                } catch (e) { failed.push(dir); }
+              }
+              await deleteSecret("api_key_glm");
+              await AsyncStorage.multiRemove(["api_key_deepseek", "llm_provider", "llm_model"]);
               setGlmKey(""); setDeepseekKey("");
-              Alert.alert("已清除", "所有数据已被删除");
+              if (failed.length > 0) {
+                Alert.alert("部分数据删除失败", "部分数据删除失败，请重试");
+              } else {
+                Alert.alert("已清除", "所有数据已被删除");
+              }
             } catch (err: any) { Alert.alert("操作失败", err?.message ?? "请重试"); }
+            finally { setClearing(false); }
           }},
         ]);
       }},
@@ -135,15 +161,19 @@ export default function SettingsScreen() {
             <View className="flex-row items-center"><Ionicons name="server-outline" size={20} color="#6b7280" /><Text className="text-gray-700 text-sm ml-3">数据库信息</Text></View>
             <Ionicons name="chevron-forward" size={16} color="#d1d5db" />
           </TouchableOpacity>
-          <TouchableOpacity className="flex-row items-center justify-between px-5 py-4" onPress={handleClearAllData}>
-            <View className="flex-row items-center"><Ionicons name="warning-outline" size={20} color="#ef4444" /><Text className="text-red-600 text-sm ml-3">清除所有数据</Text></View>
+          <TouchableOpacity className="flex-row items-center justify-between px-5 py-4" onPress={handleClearAllData} disabled={clearing}>
+            {clearing ? (
+              <View className="flex-row items-center"><ActivityIndicator size="small" color="#ef4444" /><Text className="text-red-600 text-sm ml-3">清除中...</Text></View>
+            ) : (
+              <View className="flex-row items-center"><Ionicons name="warning-outline" size={20} color="#ef4444" /><Text className="text-red-600 text-sm ml-3">清除所有数据</Text></View>
+            )}
             <Ionicons name="chevron-forward" size={16} color="#d1d5db" />
           </TouchableOpacity>
         </View>
 
         <Text className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">关于</Text>
         <View className="bg-white rounded-2xl border border-gray-100 mb-5 overflow-hidden">
-          <View className="flex-row items-center justify-between px-5 py-4 border-b border-gray-50"><Text className="text-gray-700 text-sm">版本</Text><Text className="text-gray-400 text-sm">1.0.0</Text></View>
+          <View className="flex-row items-center justify-between px-5 py-4 border-b border-gray-50"><Text className="text-gray-700 text-sm">版本</Text><Text className="text-gray-400 text-sm">{Constants.expoConfig?.version ?? "1.0.0"}</Text></View>
           <View className="flex-row items-center justify-between px-5 py-4"><Text className="text-gray-700 text-sm">技术栈</Text><Text className="text-gray-400 text-xs">React Native · Expo SDK 51 · SQLite</Text></View>
         </View>
         <View className="items-center py-6"><Text className="text-gray-300 text-xs">LabFlow — 科研实验管理助手</Text></View>

@@ -1,10 +1,12 @@
-import { useState, useMemo, useCallback, Component, type ReactNode } from "react";
+import { useState, useMemo, useRef, useCallback, Component, type ReactNode } from "react";
 import {
   View,
   Text,
   ScrollView,
   TouchableOpacity,
   TextInput,
+  Alert,
+  ActivityIndicator,
   LayoutAnimation,
   Platform,
   UIManager,
@@ -22,7 +24,7 @@ import {
   type PCRMixResult,
 } from "../../utils/calculations";
 import { useFocusEffect } from "expo-router";
-import * as SQLite from "expo-sqlite";
+import { getDb } from "../../db/database";
 import { getKitSummaries, getDeductionPreview } from "../../services/inventoryService";
 
 if (
@@ -276,8 +278,14 @@ function ToolsScreenInner() {
     const m = parseFloat(massGram);
     const mm = parseFloat(molarMass);
     const v = parseFloat(volumeML);
-    if (isNaN(m) || isNaN(mm) || isNaN(v) || mm <= 0 || v <= 0) return null;
+    // 质量 <= 0 也是非法输入（负质量无物理意义），与 >0 校验一并处理
+    if (isNaN(m) || isNaN(mm) || isNaN(v) || mm <= 0 || v <= 0 || m <= 0) return null;
     return calcMolarity(m, mm, v);
+  }, [massGram, molarMass, volumeML]);
+
+  const molarityHint = useMemo(() => {
+    if (!massGram.trim() && !molarMass.trim() && !volumeML.trim()) return "";
+    return "请输入完整且有效的参数（质量、摩尔质量、体积均需大于 0）";
   }, [massGram, molarMass, volumeML]);
 
   // 质量浓度（仅当输入有效时）
@@ -301,6 +309,14 @@ function ToolsScreenInner() {
     return calcDilution(s, t, v);
   }, [stockConc, targetConc, targetVol]);
 
+  // 稀释非法输入提示：calcDilution 对不可配制场景返回 NaN 字段
+  const dilutionHint = useMemo(() => {
+    if (!stockConc.trim() && !targetConc.trim() && !targetVol.trim()) return "";
+    if (!dilutionResult) return "请输入完整且有效的参数（浓度与体积均需大于 0）";
+    if (!isFinite(dilutionResult.stockVolume)) return "输入无效：目标浓度不能高于母液浓度";
+    return "";
+  }, [stockConc, targetConc, targetVol, dilutionResult]);
+
   // ── ③ PCR 体系 ──
   const [pcrVol, setPcrVol] = useState("50");
   const [pcrSamples, setPcrSamples] = useState("8");
@@ -314,10 +330,21 @@ function ToolsScreenInner() {
     )
   );
 
+  // 输入 "0" 时不再静默回退默认值，而是显示错误提示
+  const pcrErrorText = useMemo(() => {
+    if (pcrVol.trim() !== "" && safeInt(pcrVol) <= 0) return "反应体积需大于 0";
+    if (pcrSamples.trim() !== "" && safeInt(pcrSamples) <= 0) return "样品数量需大于 0";
+    return "";
+  }, [pcrVol, pcrSamples]);
+
   const pcrResult = useMemo(() => {
-    const vol = safeInt(pcrVol) || 50;
-    const samples = safeInt(pcrSamples) || 1;
-    if (vol <= 0 || samples <= 0) return null;
+    const vol = safeInt(pcrVol);
+    const samples = safeInt(pcrSamples);
+    if (pcrVol.trim() !== "" && vol <= 0) return null;
+    if (pcrSamples.trim() !== "" && samples <= 0) return null;
+    // 空输入时回退默认值；显式 "0" 已在上方拦截
+    const effectiveVol = vol > 0 ? vol : 50;
+    const effectiveSamples = samples > 0 ? samples : 1;
 
     const customComponents = DEFAULT_PCR_COMPONENTS.map((c) => {
       if (c.name === "ddH₂O") return c;
@@ -325,7 +352,7 @@ function ToolsScreenInner() {
       return { ...c, ratio: isNaN(ratio) || ratio < 0 ? c.ratio : ratio };
     });
 
-    return calcPCRMix(vol, samples, customComponents);
+    return calcPCRMix(effectiveVol, effectiveSamples, customComponents);
   }, [pcrVol, pcrSamples, pcrRatios]);
 
   // ── ④ NanoDrop ──
@@ -341,6 +368,11 @@ function ToolsScreenInner() {
     return calcNucleicAcidConc(a, isNaN(d) ? 1 : d, naType);
   }, [a260, dilFactor, naType]);
 
+  const nanodropHint = useMemo(() => {
+    if (!a260.trim() && !dilFactor.trim()) return "";
+    return "请输入完整且有效的参数（A260 ≥ 0，稀释倍数 > 0）";
+  }, [a260, dilFactor]);
+
   const purity = useMemo(() => {
     const r = parseFloat(a260a280);
     if (isNaN(r)) return null;
@@ -354,20 +386,35 @@ function ToolsScreenInner() {
   const [selectedTemplateId, setSelectedTemplateId] = useState<number | null>(null);
   const [templateReactionCount, setTemplateReactionCount] = useState("8");
   const [templatePreview, setTemplatePreview] = useState<any[]>([]);
+  const [previewPending, setPreviewPending] = useState(false);
+  // 模板加载序号：快速切换试剂盒时丢弃过期响应
+  const kitTemplateSeqRef = useRef(0);
 
   useFocusEffect(useCallback(() => {
     (async () => {
-      try { setKits(await getKitSummaries() as any[]); } catch {}
+      try { setKits(await getKitSummaries()); } catch (e) { console.error("[tools] 加载试剂盒失败", e); }
     })();
   }, []));
 
   const loadTemplates = async (kitId: number) => {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
-    const rows = await db.getAllAsync<any>(
-      "SELECT id, template_name, total_vol_ul, components_json FROM reaction_templates WHERE kit_id = ?", [kitId]
-    );
-    setTemplates(rows);
+    const seq = ++kitTemplateSeqRef.current;
+    setTemplates([]); // 加载前清空，避免残留上一个试剂盒的模板
+    try {
+      const db = await getDb();
+      const rows = await db.getAllAsync<{ id: number; template_name: string; total_vol_ul: number; components_json: string }>(
+        "SELECT id, template_name, total_vol_ul, components_json FROM reaction_templates WHERE kit_id = ?", [kitId]
+      );
+      if (seq !== kitTemplateSeqRef.current) return; // 过期响应丢弃
+      setTemplates(rows);
+    } catch (e: any) {
+      if (seq === kitTemplateSeqRef.current) Alert.alert("加载失败", e?.message ?? "模板加载失败");
+    }
   };
+
+  const templateCountError = useMemo(() => {
+    if (templateReactionCount.trim() !== "" && safeInt(templateReactionCount) <= 0) return "反应管数需大于 0";
+    return "";
+  }, [templateReactionCount]);
 
   const templateResult = useMemo(() => {
     if (!selectedTemplateId) return null;
@@ -376,7 +423,10 @@ function ToolsScreenInner() {
     try {
       const comps = JSON.parse(tmpl.components_json) as { name: string; vol_ul: number; ratio: string }[];
       if (!Array.isArray(comps) || comps.length === 0) return null;
-      const n = safeInt(templateReactionCount) || 1;
+      // 显式 "0" 已由 templateCountError 拦截，这里仅处理空输入回退
+      const rawN = safeInt(templateReactionCount);
+      if (templateReactionCount.trim() !== "" && rawN <= 0) return null;
+      const n = rawN > 0 ? rawN : 1;
       const scale = 1.1;
       const totalTubes = Math.max(1, Math.ceil(n * scale));
       const perTube = comps.map((c) => ({ ...c, perTube: Math.max(0, c.vol_ul ?? 0) }));
@@ -388,10 +438,14 @@ function ToolsScreenInner() {
   }, [selectedTemplateId, templateReactionCount, templates]);
 
   const loadTemplatePreview = async () => {
-    if (!selectedKitId || !selectedTemplateId) return;
+    if (!selectedKitId || !selectedTemplateId || previewPending) return;
     const n = parseInt(templateReactionCount) || 1;
-    const preview = await getDeductionPreview(selectedKitId, selectedTemplateId, n);
-    setTemplatePreview(preview);
+    setPreviewPending(true);
+    try {
+      const preview = await getDeductionPreview(selectedKitId, selectedTemplateId, n);
+      setTemplatePreview(preview);
+    } catch (e: any) { Alert.alert("计算失败", e?.message ?? "请重试"); }
+    finally { setPreviewPending(false); }
   };
 
   // ── 展开/折叠 ──
@@ -495,6 +549,9 @@ function ToolsScreenInner() {
                           = {safeNum(molarityResult * 1000, 2)} mM{ massConcText ? ` · ${massConcText}` : "" }
                         </Text>
                       )}
+                      {molarityResult === null && molarityHint !== "" && (
+                        <Text className="text-amber-600 text-xs mt-2 text-center">{molarityHint}</Text>
+                      )}
                     </View>
                   )}
 
@@ -527,7 +584,7 @@ function ToolsScreenInner() {
                         placeholder="如 100"
                       />
 
-                      {dilutionResult && (
+                      {dilutionResult && isFinite(dilutionResult.stockVolume) && (
                         <View>
                           <ResultBox
                             label="需取母液 V₁"
@@ -547,6 +604,9 @@ function ToolsScreenInner() {
                             </Text>
                           </View>
                         </View>
+                      )}
+                      {dilutionHint !== "" && (
+                        <Text className="text-amber-600 text-xs mt-2 text-center">{dilutionHint}</Text>
                       )}
                     </View>
                   )}
@@ -582,6 +642,10 @@ function ToolsScreenInner() {
                           />
                         </View>
                       </View>
+
+                      {pcrErrorText !== "" && (
+                        <Text className="text-red-500 text-xs mb-3">{pcrErrorText}</Text>
+                      )}
 
                       {/* 组分比例调整 */}
                       <Text className="text-sm font-medium text-gray-600 mb-2">
@@ -686,6 +750,9 @@ function ToolsScreenInner() {
                           = {(nanodropResult / 1000).toFixed(2)} μg/μL
                         </Text>
                       )}
+                      {nanodropResult === null && nanodropHint !== "" && (
+                        <Text className="text-amber-600 text-xs mt-2 text-center">{nanodropHint}</Text>
+                      )}
 
                       {/* 纯度评估 */}
                       <View className="border-t border-gray-100 mt-4 pt-4">
@@ -764,6 +831,9 @@ function ToolsScreenInner() {
                       </ScrollView>
                     </>
                   )}
+                  {selectedKitId && templates.length === 0 && (
+                    <Text className="text-gray-400 text-xs mb-3">该试剂盒暂无反应模板</Text>
+                  )}
 
                   {selectedTemplateId && (
                     <>
@@ -771,9 +841,10 @@ function ToolsScreenInner() {
                         <View className="flex-1">
                           <Text className="text-sm font-medium text-gray-600 mb-1.5">反应管数</Text>
                           <TextInput className="input-field text-center" value={templateReactionCount} onChangeText={setTemplateReactionCount} keyboardType="number-pad" />
+                          {templateCountError !== "" && <Text className="text-red-500 text-xs mt-1">{templateCountError}</Text>}
                         </View>
-                        <TouchableOpacity className="mt-5 bg-teal-500 px-4 py-3 rounded-xl" onPress={loadTemplatePreview}>
-                          <Text className="text-white text-xs font-semibold">计算消耗</Text>
+                        <TouchableOpacity className="mt-5 bg-teal-500 px-4 py-3 rounded-xl" onPress={loadTemplatePreview} disabled={previewPending}>
+                          {previewPending ? <ActivityIndicator size="small" color="white" /> : <Text className="text-white text-xs font-semibold">计算消耗</Text>}
                         </TouchableOpacity>
                       </View>
 

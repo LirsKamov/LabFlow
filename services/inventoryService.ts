@@ -9,10 +9,11 @@
  *  - 手动调库
  */
 
-import * as SQLite from "expo-sqlite";
 import * as Notifications from "expo-notifications";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import type { ReactionTemplate } from "../db/schema";
+import { getDb, withTransaction } from "../db/database";
+import { toLocalDateString } from "../utils/date";
+import type { ReactionTemplate, UsageLog } from "../db/schema";
 
 // ─── 类型 ────────────────────────────────────────────────────
 
@@ -91,6 +92,9 @@ export function healthColor(health: number): { bg: string; text: string; label: 
  * @param experimentId     关联实验 ID（可为 null）
  * @param reactionCount    反应管数
  * @param templateId       使用的反应体系模板 ID
+ *
+ * 扣减+日志在同一事务内；低量通知在事务外发送，
+ * 避免通知失败回滚扣减。
  */
 export async function deductKitUsage(
   kitId: number,
@@ -99,77 +103,82 @@ export async function deductKitUsage(
   templateId: number
 ): Promise<{ success: boolean; error?: string; lowComponents?: string[] }> {
   try {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
+    const lowItems: { id: number; name: string; unit: string; qty: number }[] = [];
 
-    // 读取反应模板
-    const tmpl = await db.getFirstAsync<ReactionTemplate>(
-      "SELECT * FROM reaction_templates WHERE id = ? AND kit_id = ?",
-      [templateId, kitId]
-    );
-    if (!tmpl) return { success: false, error: "未找到反应体系模板" };
-
-    const components = JSON.parse(tmpl.components_json) as {
-      name: string;
-      vol_ul: number;
-      ratio: string;
-    }[];
-
-    // 读取内容物
-    const allComponents = await db.getAllAsync<{
-      id: number;
-      name: string;
-      unit: string;
-      current_qty: number;
-      low_threshold: number;
-    }>("SELECT id, name, unit, current_qty, low_threshold FROM kit_components WHERE kit_id = ?", [kitId]);
-
-    const lowComponents: string[] = [];
-
-    // 批量扣减
-    for (const comp of components) {
-      const match = allComponents.find(
-        (c) => c.name.toLowerCase() === comp.name.toLowerCase()
+    await withTransaction(async (db) => {
+      // 读取反应模板
+      const tmpl = await db.getFirstAsync<ReactionTemplate>(
+        "SELECT * FROM reaction_templates WHERE id = ? AND kit_id = ?",
+        [templateId, kitId]
       );
-      if (!match) continue; // 模板中的组分在库存中不存在，跳过
+      if (!tmpl) throw new Error("未找到反应体系模板");
 
-      const deductQty = comp.vol_ul * reactionCount;
-      const newQty = Math.max(0, match.current_qty - deductQty);
+      const components = JSON.parse(tmpl.components_json) as {
+        name: string;
+        vol_ul: number;
+        ratio: string;
+      }[];
 
-      // 更新库存
-      await db.runAsync(
-        "UPDATE kit_components SET current_qty = ? WHERE id = ?",
-        [newQty, match.id]
-      );
+      // 读取内容物
+      const allComponents = await db.getAllAsync<{
+        id: number;
+        name: string;
+        unit: string;
+        current_qty: number;
+        low_threshold: number;
+      }>("SELECT id, name, unit, current_qty, low_threshold FROM kit_components WHERE kit_id = ?", [kitId]);
 
-      // 写入使用日志
-      await db.runAsync(
-        `INSERT INTO usage_logs (kit_id, experiment_id, component_id, used_qty, unit, note)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [kitId, experimentId, match.id, deductQty, match.unit, `反应 ×${reactionCount}，模板: ${tmpl.template_name}`]
-      );
+      // 批量扣减
+      for (const comp of components) {
+        const match = allComponents.find(
+          (c) => c.name.trim().toLowerCase() === comp.name.trim().toLowerCase()
+        );
+        if (!match) continue; // 模板中的组分在库存中不存在，跳过
 
-      // 检查低量预警
-      if (newQty <= match.low_threshold) {
-        lowComponents.push(match.name);
-        if (await shouldNotify(match.id)) {
-          const kit = await db.getFirstAsync<{ name: string }>(
-            "SELECT name FROM kits WHERE id = ?", [kitId]
-          );
-          await Notifications.scheduleNotificationAsync({
-            content: {
-              title: "⚠️ 试剂库存不足",
-              body: `「${kit?.name ?? "试剂盒"}」的「${match.name}」库存不足！当前剩余：${newQty.toFixed(1)} ${match.unit}`,
-              sound: "default",
-              data: { type: "inventory", componentId: match.id },
-            },
-            trigger: { type: Notifications.SchedulableTriggerInputTypes.TIME_INTERVAL, seconds: 1, channelId: "labflow-daily" },
-          });
-          await markNotified(match.id);
+        const deductQty = comp.vol_ul * reactionCount;
+        const newQty = Math.max(0, match.current_qty - deductQty);
+
+        // 更新库存
+        await db.runAsync(
+          "UPDATE kit_components SET current_qty = ? WHERE id = ?",
+          [newQty, match.id]
+        );
+
+        // 写入使用日志（operation = 'use' 消耗）
+        await db.runAsync(
+          `INSERT INTO usage_logs (kit_id, experiment_id, component_id, used_qty, unit, note, operation)
+           VALUES (?, ?, ?, ?, ?, ?, 'use')`,
+          [kitId, experimentId, match.id, deductQty, match.unit, `反应 ×${reactionCount}，模板: ${tmpl.template_name}`]
+        );
+
+        // 记录低量组分（通知在事务外做）
+        if (newQty <= match.low_threshold) {
+          lowItems.push({ id: match.id, name: match.name, unit: match.unit, qty: newQty });
         }
+      }
+    });
+
+    // 低量通知（事务外，失败不影响已提交的扣减）
+    for (const item of lowItems) {
+      if (await shouldNotify(item.id)) {
+        const db = await getDb();
+        const kit = await db.getFirstAsync<{ name: string }>(
+          "SELECT name FROM kits WHERE id = ?", [kitId]
+        );
+        await Notifications.scheduleNotificationAsync({
+          content: {
+            title: "⚠️ 试剂库存不足",
+            body: `「${kit?.name ?? "试剂盒"}」的「${item.name}」库存不足！当前剩余：${item.qty.toFixed(1)} ${item.unit}`,
+            sound: "default",
+            data: { type: "inventory", componentId: item.id },
+          },
+          trigger: { seconds: 1, channelId: "labflow-daily" },
+        });
+        await markNotified(item.id);
       }
     }
 
-    return { success: true, lowComponents };
+    return { success: true, lowComponents: lowItems.map((i) => i.name) };
   } catch (err: any) {
     return { success: false, error: err?.message ?? "扣减失败" };
   }
@@ -184,7 +193,7 @@ export async function getRemainingRuns(
   templateId?: number
 ): Promise<RemainingRuns | null> {
   try {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
+    const db = await getDb();
 
     // 获取模板
     let templateComponents: { name: string; vol_ul: number }[] = [];
@@ -214,7 +223,7 @@ export async function getRemainingRuns(
     let limiting = "";
 
     for (const tc of templateComponents) {
-      const match = components.find((c) => c.name.toLowerCase() === tc.name.toLowerCase());
+      const match = components.find((c) => c.name.trim().toLowerCase() === tc.name.trim().toLowerCase());
       if (!match || tc.vol_ul <= 0) continue;
       const runs = Math.floor(match.current_qty / tc.vol_ul);
       if (runs < minRuns) {
@@ -223,8 +232,8 @@ export async function getRemainingRuns(
       }
     }
 
-    const limitingComp = components.find((c) => c.name === limiting);
-    const limitingTemplate = templateComponents.find((c) => c.name === limiting);
+    const limitingComp = components.find((c) => c.name.trim() === limiting.trim());
+    const limitingTemplate = templateComponents.find((c) => c.name.trim() === limiting.trim());
 
     return {
       runs: minRuns === Infinity ? 0 : minRuns,
@@ -239,6 +248,9 @@ export async function getRemainingRuns(
 
 /**
  * 获取库存消耗统计 & 耗尽预测
+ *
+ * 统计口径与补货/纠错分离：SUM 只统计 operation='use' 的消耗，
+ * 避免补货正数冲抵消耗导致耗尽预测偏早（老数据迁移后默认 'use'）。
  */
 export async function getUsageStats(
   kitId: number,
@@ -249,15 +261,17 @@ export async function getUsageStats(
   avgDailyUse: number;
 }> {
   try {
-    const db = await SQLite.openDatabaseAsync("labflow.db");
+    const db = await getDb();
     const since = new Date();
     since.setDate(since.getDate() - days);
-    const sinceStr = since.toISOString().split("T")[0];
+    const sinceStr = toLocalDateString(since);
 
     const rows = await db.getAllAsync<{ date: string; total_used: number; exp_count: number }>(
-      `SELECT date(used_at) AS date, SUM(used_qty) AS total_used, COUNT(DISTINCT experiment_id) AS exp_count
+      `SELECT date(used_at) AS date,
+              SUM(CASE WHEN operation = 'use' THEN used_qty ELSE 0 END) AS total_used,
+              COUNT(DISTINCT CASE WHEN operation = 'use' THEN experiment_id END) AS exp_count
        FROM usage_logs
-       WHERE kit_id = ? AND date(used_at) >= ?
+       WHERE kit_id = ? AND operation = 'use' AND date(used_at) >= ?
        GROUP BY date(used_at)
        ORDER BY date DESC`,
       [kitId, sinceStr]
@@ -281,7 +295,7 @@ export async function getUsageStats(
       const daysLeft = Math.floor(runs.runs / (avgDailyUse || 1));
       const d = new Date();
       d.setDate(d.getDate() + daysLeft);
-      depletionDate = d.toISOString().split("T")[0];
+      depletionDate = toLocalDateString(d);
     }
 
     return { stats, depletionDate, avgDailyUse };
@@ -294,7 +308,7 @@ export async function getUsageStats(
  * 获取试剂盒所有内容物库存（含健康度）
  */
 export async function getKitComponents(kitId: number): Promise<ComponentStock[]> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
   const rows = await db.getAllAsync<ComponentStock>(
     "SELECT * FROM kit_components WHERE kit_id = ? ORDER BY name", [kitId]
   );
@@ -307,6 +321,9 @@ export async function getKitComponents(kitId: number): Promise<ComponentStock[]>
 
 /**
  * 获取试剂盒列表（含健康度总览）
+ *
+ * 一条聚合 SQL 同时拿 kits + componentCount + 健康度（消除 N+1）；
+ * remainingRuns 仍需逐 kit 调用 getRemainingRuns（内部两次查询可接受）。
  */
 export async function getKitSummaries(): Promise<
   {
@@ -314,21 +331,34 @@ export async function getKitSummaries(): Promise<
     componentCount: number; overallHealth: number; remainingRuns: number;
   }[]
 > {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
-  const kits = await db.getAllAsync<{ id: number; name: string; brand: string }>(
-    "SELECT id, name, brand FROM kits ORDER BY created_at DESC"
+  const db = await getDb();
+  // SQLite 无标量 MIN/MAX，健康度用 CASE 钳制到 [0,1] 后取 AVG（NULL 被忽略）
+  const rows = await db.getAllAsync<{ id: number; name: string; brand: string; component_count: number; health: number }>(
+    `SELECT k.id, k.name, k.brand,
+            COUNT(kc.id) AS component_count,
+            COALESCE(AVG(
+              CASE WHEN kc.initial_qty > 0 THEN
+                (CASE
+                  WHEN kc.current_qty >= kc.initial_qty THEN 1.0
+                  WHEN kc.current_qty <= 0 THEN 0.0
+                  ELSE kc.current_qty / kc.initial_qty
+                END)
+              END
+            ), 1) AS health
+     FROM kits k LEFT JOIN kit_components kc ON kc.kit_id = k.id
+     GROUP BY k.id
+     ORDER BY k.created_at DESC`
   );
-  const result = [];
-  for (const kit of kits) {
-    const components = await getKitComponents(kit.id);
-    const overallHealth = components.length > 0
-      ? components.reduce((s, c) => s + c.health, 0) / components.length
-      : 1;
+
+  const result: { id: number; name: string; brand: string; componentCount: number; overallHealth: number; remainingRuns: number }[] = [];
+  for (const kit of rows) {
     const runs = await getRemainingRuns(kit.id);
     result.push({
-      ...kit,
-      componentCount: components.length,
-      overallHealth,
+      id: kit.id,
+      name: kit.name,
+      brand: kit.brand,
+      componentCount: kit.component_count,
+      overallHealth: kit.health,
       remainingRuns: runs?.runs ?? 0,
     });
   }
@@ -339,12 +369,12 @@ export async function getKitSummaries(): Promise<
  * 获取用量历史
  */
 export async function getUsageHistory(kitId: number, limit = 50) {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
-  return await db.getAllAsync<{
-    id: number; component_name: string; used_qty: number; unit: string;
-    used_at: string; note: string; experiment_name: string | null;
+  const db = await getDb();
+  return await db.getAllAsync<UsageLog & {
+    component_name: string;
+    experiment_name: string | null;
   }>(
-    `SELECT ul.id, kc.name AS component_name, ul.used_qty, ul.unit, ul.used_at, ul.note, e.name AS experiment_name
+    `SELECT ul.id, kc.name AS component_name, ul.used_qty, ul.unit, ul.used_at, ul.note, ul.operation, e.name AS experiment_name
      FROM usage_logs ul
      JOIN kit_components kc ON ul.component_id = kc.id
      LEFT JOIN experiments e ON ul.experiment_id = e.id
@@ -356,13 +386,16 @@ export async function getUsageHistory(kitId: number, limit = 50) {
 
 /**
  * 手动调整库存（补货/纠错）
+ *
+ * operation 与消耗统计口径分离：delta >= 0 记 'restock'，否则 'adjust'，
+ * 两者都不计入 getUsageStats 的消耗 SUM。
  */
 export async function adjustInventory(
   componentId: number,
   delta: number,
   reason: string
 ): Promise<void> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
   const comp = await db.getFirstAsync<{ kit_id: number; current_qty: number; unit: string; name: string }>(
     "SELECT kit_id, current_qty, unit, name FROM kit_components WHERE id = ?", [componentId]
   );
@@ -370,8 +403,8 @@ export async function adjustInventory(
   const newQty = Math.max(0, comp.current_qty + delta);
   await db.runAsync("UPDATE kit_components SET current_qty = ? WHERE id = ?", [newQty, componentId]);
   await db.runAsync(
-    "INSERT INTO usage_logs (kit_id, component_id, used_qty, unit, note) VALUES (?, ?, ?, ?, ?)",
-    [comp.kit_id, componentId, Math.abs(delta), comp.unit, `${delta >= 0 ? "补货" : "纠错"}: ${reason} (${delta >= 0 ? "+" : ""}${delta} ${comp.unit})`]
+    "INSERT INTO usage_logs (kit_id, component_id, used_qty, unit, note, operation) VALUES (?, ?, ?, ?, ?, ?)",
+    [comp.kit_id, componentId, Math.abs(delta), comp.unit, `${delta >= 0 ? "补货" : "纠错"}: ${reason} (${delta >= 0 ? "+" : ""}${delta} ${comp.unit})`, delta >= 0 ? "restock" : "adjust"]
   );
 }
 
@@ -383,7 +416,7 @@ export async function getDeductionPreview(
   templateId: number,
   reactionCount: number
 ): Promise<DeductionPreview[]> {
-  const db = await SQLite.openDatabaseAsync("labflow.db");
+  const db = await getDb();
   const tmpl = await db.getFirstAsync<{ components_json: string }>(
     "SELECT components_json FROM reaction_templates WHERE id = ?", [templateId]
   );
@@ -394,7 +427,7 @@ export async function getDeductionPreview(
   );
 
   return templateComponents.map((tc) => {
-    const match = stockComponents.find((s) => s.name.toLowerCase() === tc.name.toLowerCase());
+    const match = stockComponents.find((s) => s.name.trim().toLowerCase() === tc.name.trim().toLowerCase());
     const totalDeduct = tc.vol_ul * reactionCount;
     const currentQty = match?.current_qty ?? 0;
     const afterDeduction = currentQty - totalDeduct;
